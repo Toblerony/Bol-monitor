@@ -1,0 +1,2 @@
+e55e6e2e5da7caccabc9357ffb845d4c8eb6e374b0ed089e11860e64bbd247a5
+# sha256(host:port:user:pass) for this session's proxy.txt line — residential.roundproxies.com:5000 user=cl***0
