@@ -736,7 +736,7 @@ def scan_once(
             f"timeout={timeout:.1f}s",
             flush=True,
         )
-        print(f"[{utc_now()}] fetching sitemap index: {index_url}", flush=True)
+    print(f"[{utc_now()}] fetching sitemap index: {index_url}", flush=True)
     index_body = fetch_bytes(index_url, timeout, retries, proxy_pool)
     if not silent:
         print(

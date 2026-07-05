@@ -23,9 +23,30 @@ from tkinter import filedialog, messagebox, scrolledtext, ttk
 SCRIPT_DIR = Path(__file__).resolve().parent
 BOT_SCRIPT = SCRIPT_DIR / "1.py"
 
-# stdout lines from browser_mode: ``[S1]`` … ``[S3]`` → log tabs 1–3; ``[SETUP] Slot N:`` → tab N.
 _LOG_SLOT_TAG_RE = re.compile(r"^\[S([1-9]\d*)\]")
-_LOG_SETUP_SLOT_LINE_RE = re.compile(r"^\[SETUP\]\s*Slot\s+(\d+)\s*:", re.I)
+_LOG_SETUP_BOL_ACCOUNT_RE = re.compile(r"^\[SETUP\].*?\bbol_account=(\d+)\b")
+_LOG_BRACKET_S_ANYWHERE_RE = re.compile(r"\[S([1-9]\d*)\]")
+_LOG_SESSION_JSON_RE = re.compile(r"\bsession_([1-9]\d*)\.json\b")
+
+
+def _dotenv_file_truthy(key: str, default_false: bool = True) -> bool:
+    """Read SCRIPT_DIR/.env for ``key`` (first match). Used so GUI log routing matches browser defaults."""
+    path = SCRIPT_DIR / ".env"
+    if not path.is_file():
+        return not default_false
+    try:
+        raw = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return not default_false
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, _, v = line.partition("=")
+        if k.strip() != key:
+            continue
+        return v.strip().strip('"').strip("'").lower() in ("1", "true", "yes", "on")
+    return not default_false
 
 PRODUCTS_PATH = SCRIPT_DIR / "product.csv"
 PROXY_PATH = SCRIPT_DIR / "proxy.txt"
@@ -49,35 +70,81 @@ ACCENT_GRAY = "#6b7280"
 
 HOW_IT_WORKS_TEXT = """HOW IT WORKS
 
-Files next to gui.py / 1.py:
-  • product.csv — Bol product URLs (Products tab).
-  • proxy.txt — line N ↔ Nth http URL in product.csv (order), up to 3 Chromium slots (BOL_BROWSER_MAX_PARALLEL).
-    cookies/session_<n>.json + session_<n>.fingerprint.txt (sha256 + comment); wrong proxy line clears session on Start.
-  • proxies.txt — optional failover pool (same format): browser mode only, when login/session breaks (not offline PDP).
-  • Accounts — slot 1 uses Email1/Password1 (else Email/Password), slot 2 Email2/Password2, slot 3 Email3/Password3 (.env).
-  • Session — auto-saved after login. First run: NL homepage → Inloggen per slot.
-  • discord_webhook.txt (+ optional thread ids) — payment / cart alerts.
+FILES (same folder as gui.py / 1.py)
+  • product.csv — Up to 3 product URLs (Products tab); each row picks a Bol login (**Email1…Email3**). Rows may share the
+    same account if you want — **bol_account N** always means proxy.txt **line N** + **session_N.json** + **EmailN**, no matter
+    whether that row is first or third in the list.
+  • proxy.txt — One host:port:user:pass per line. Line N is the tunnel for bol_account N (default: **only** that line —
+    no auto-switch to other rows; product URL in CSV does not change which line is used). Optional:
+    BOL_BROWSER_ALLOW_PROXY_FAILOVER_OTHER_LINES=1 lets browser mode rotate through other lines after login loss.
+  • cookies/session_<n>.json + session_<n>.fingerprint.txt + session_<n>.binding.json — Saved login per **bol_account**;
+    fingerprint matches **that account's tunnel** (proxy line N); binding stores product URL + bol_account +
+    a hash of that row's Email/Password from .env — change CSV row, login choice, **or** those .env values and Start
+    clears that session so you log in again (sticky PDP / proxy binding unchanged).
+  • .env — Email1/Password1 … Email3/Password3 (or legacy Email/Password for account 1). Optional browser-only vars
+    (homepage/CMP/login tuning) live here; see browser_mode.py env names if you need them.
+  • discord_webhook.txt (+ optional thread fields) — Alerts.
 
-Bot flow (always Playwright Chromium, visible window): login → monitor PDPs → add to cart → checkout in the
-same browser. Payment URL is saved and Discord gets URL + item details.
+SLOT BINDING (browser bot)
+  • **Parallel or single — same rule:** the Bol login you pick on each product row (**Email1 / Email2 / Email3**)
+    writes **bol_account** into product.csv. That row’s PDP opens only in **session_N.json + proxy line N + EmailN**
+    — **N is the account you chose, not the row number.** Parallel runs sort worker windows by bol_account (account 1 left,
+    account 3 right) so the window matches **S1 / S2 / S3**. Put **BOL_BROWSER_WORKERS_CSV_ROW_ORDER=1** in .env only if you
+    want workers strictly in CSV row order instead.
+  • Up to BOL_BROWSER_MAX_PARALLEL Chromium windows (Settings). Logs use **[SN]** where N = bol_account.
+  • Default **BOL_BROWSER_STICKY_SLOT_PRODUCT_URL=0**: same Chromium/login/proxy stay sticky; each CSV reload resolves the
+    URL from rows matching that worker's bol_account (multiple rows per account: pick index among those rows stays stable).
+  • Set **BOL_BROWSER_STICKY_SLOT_PRODUCT_URL=1** to freeze each worker's PDP URL to the launch snapshot (live CSV edits
+    ignored until restart).
 
-Polling is randomized (not fixed seconds):
-  • Online / in-stock path: random delay between BOL_BROWSER_POLL_ONLINE_MIN … MAX (default 2–5 s).
-  • Offline / thin PDP / errors: random delay between BOL_BROWSER_POLL_OFFLINE_MIN … MAX (default 40–60 s).
+BOT FLOW
+  • Headed Playwright Chromium: per-slot login if needed → poll assigned PDP → add to cart when available → checkout
+    in the same window. Payment URL can be recorded; Discord notifications use your webhook files.
 
-Checkout login (when Bol asks for Inloggen mid-checkout): delays come from Settings —
-pause before filling email/password, pause before pressing Inloggen, settle wait after redirect.
+DELAYS — SETTINGS TAB (gui_settings.json, applied when you press Start)
+  These values are passed into the bot as environment variables.
 
-Edit → Save → Start bot. Stop before changing proxy or session files.
+  PDP polling (random each time, uniform between min and max):
+    • BOL_BROWSER_POLL_OOS_MIN / BOL_BROWSER_POLL_OOS_MAX — delay between checks while the PDP is **loaded** (page up)
+      but you are still waiting: **out of stock**, **Not available**, or **before** the yellow add-to-cart shows / ATC retries.
+      Defaults 6 and 9 — Settings → PDP polling. **MIN is also enforced** between PDP snapshots (you cannot poll faster than MIN).
+    • BOL_BROWSER_FULL_RELOAD_EVERY_N_POLLS — full ``page.goto`` every N polls (default 3); between those, light DOM reads only
+      (less visual flashing; stock still checked each poll).
+    • BOL_BROWSER_POLL_OFFLINE_MIN / BOL_BROWSER_POLL_OFFLINE_MAX — when the listing looks **offline**, thin shell, or errors
+      (defaults 40 and 60).
+
+  Checkout login (mid-flow Inloggen on login.bol.com):
+    • BOL_CHECKOUT_LOGIN_PAUSE_BEFORE_FILL_SEC — wait after the form appears before typing credentials.
+    • BOL_CHECKOUT_LOGIN_PAUSE_BEFORE_SUBMIT_SEC — wait after filling before clicking Inloggen.
+    • BOL_CHECKOUT_LOGIN_SETTLE_SEC — short pause after submit while navigation begins.
+    • BOL_CHECKOUT_LOGIN_MAX_REDIRECT_POLL_SEC — how long to poll the URL for a checkout redirect.
+    • BOL_CHECKOUT_LOGIN_SILENT_EXTEND_SEC — extra quiet polling if redirect is still unclear.
+    • BOL_BROWSER_CHECKOUT_LOGIN_WAIT_SEC — upper bound for manual login if auto-fill cannot complete.
+
+  Other knobs on the same tab: USE_PROXIES, BOL_BROWSER_MAX_PARALLEL (1–3), sitemap scan interval/workers/index
+  (only if sitemap is enabled).
+
+DELAYS — NOT IN THE GUI
+  Homepage load, cookie/CMP dismiss, and login-field timings are controlled only through .env variables read by
+  browser_mode.py (names prefixed like BOL_BROWSER_*). Defaults there are tuned for parallel slots; adjust there if
+  you need slower/faster login behaviour.
+
+LOGS
+  • Tabs are sorted **Acc 1 · Acc 2 · Acc 3** left to right (Email1 / Email2 / Email3 logs), **not** by which product URL
+    is first in the CSV. Lines **[SN]** (start or anywhere), **`session_N.json`**, and **`bol_account=N`** in **[SETUP]** rows
+    route to **Acc N**. Untagged lines follow the last routed tab.
+
+TIP
+  • Stop the bot before swapping proxy lines or session files if you want a clean identity change; then Start again.
 """
 
-# Written to gui_settings.json and passed as env to 1.py (browser bot).
 DEFAULT_SETTINGS: dict = {
     "USE_PROXIES": True,
     "BOL_DIAGNOSTIC_LOG": False,
     "SITEMAP_ENABLED": True,
-    "BOL_BROWSER_POLL_ONLINE_MIN": "2",
-    "BOL_BROWSER_POLL_ONLINE_MAX": "5",
+    "BOL_BROWSER_POLL_OOS_MIN": "6",
+    "BOL_BROWSER_POLL_OOS_MAX": "9",
+    "BOL_BROWSER_FULL_RELOAD_EVERY_N_POLLS": "3",
     "BOL_BROWSER_POLL_OFFLINE_MIN": "40",
     "BOL_BROWSER_POLL_OFFLINE_MAX": "60",
     "BOL_CHECKOUT_LOGIN_PAUSE_BEFORE_FILL_SEC": "0.12",
@@ -91,6 +158,19 @@ DEFAULT_SETTINGS: dict = {
     "SITEMAP_WORKERS": "1",
     "BOL_SITEMAP_INDEX": "https://www.bol.com/sitemap/nl-nl/",
 }
+
+_ACCOUNT_COMBO_PREFIX_RE = re.compile(r"^(\d+)\s*[—\-]")
+
+
+def _parallel_slot_cap(settings: dict) -> int:
+    raw = str(
+        settings.get("BOL_BROWSER_MAX_PARALLEL", DEFAULT_SETTINGS["BOL_BROWSER_MAX_PARALLEL"])
+    ).strip()
+    try:
+        return min(3, max(1, int(float(raw))))
+    except ValueError:
+        return 3
+
 
 _BOOL_SETTING_KEYS = frozenset(
     {
@@ -125,56 +205,179 @@ def ensure_product_csv_exists() -> None:
     if not PRODUCTS_PATH.exists():
         PRODUCTS_PATH.parent.mkdir(parents=True, exist_ok=True)
         with PRODUCTS_PATH.open("w", encoding="utf-8-sig", newline="") as f:
-            w = csv.DictWriter(f, fieldnames=["product_url"])
+            w = csv.DictWriter(f, fieldnames=["product_url", "bol_account"])
             w.writeheader()
 
 
-def read_product_urls_from_disk() -> list[str]:
+def _gui_load_env_map() -> dict[str, str]:
+    path = SCRIPT_DIR / ".env"
+    out: dict[str, str] = {}
+    if not path.is_file():
+        return out
+    try:
+        raw = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return out
+    for line in raw.splitlines():
+        s = line.strip()
+        if not s or s.startswith("#") or "=" not in s:
+            continue
+        k, _, v = s.partition("=")
+        k = k.strip()
+        v = v.strip().strip('"').strip("'")
+        if k:
+            out[k] = v
+    return out
+
+
+def _gui_pick_email_slot(env: dict[str, str], slot: int) -> str:
+    if slot == 0:
+        for k in (
+            "Email1",
+            "BOL_EMAIL1",
+            "email1",
+            "BOL_EMAIL",
+            "Email",
+            "email",
+        ):
+            v = (env.get(k) or "").strip()
+            if v:
+                return v
+        return ""
+    if slot == 1:
+        for k in ("Email2", "BOL_EMAIL2", "email2"):
+            v = (env.get(k) or "").strip()
+            if v:
+                return v
+        return ""
+    for k in ("Email3", "BOL_EMAIL3", "email3"):
+        v = (env.get(k) or "").strip()
+        if v:
+            return v
+    return ""
+
+
+def _gui_mask_email_hint(email: str, *, local_prefix: int = 12) -> str:
+    """
+    Show enough of the start of the address to tell accounts apart in the UI;
+    still hide the tail of a long local part.
+    """
+    e = (email or "").strip()
+    if not e:
+        return "(not set)"
+    cap = max(4, min(24, int(local_prefix)))
+    if "@" in e:
+        local, _, domain = e.partition("@")
+        if not local:
+            return f"***@{domain}"
+        if len(local) <= cap:
+            return f"{local}@{domain}"
+        return f"{local[:cap]}***@{domain}"
+    if len(e) <= cap:
+        return e
+    return f"{e[:cap]}***"
+
+
+def read_product_rows_from_disk() -> list[tuple[str, int]]:
     ensure_product_csv_exists()
     try:
         raw = PRODUCTS_PATH.read_text(encoding="utf-8-sig", errors="replace")
     except OSError:
         return []
-    urls: list[str] = []
+    out: list[tuple[str, int]] = []
     try:
         reader = csv.DictReader(io.StringIO(raw))
         fn = reader.fieldnames or []
         norm = {(n or "").strip().lstrip("\ufeff").lower(): n for n in fn if n}
-        key = norm.get("product_url")
-        if key:
-            for row in reader:
-                u = (row.get(key) or "").strip()
-                if u.startswith("http"):
-                    urls.append(u)
-            if urls:
-                return urls
+        key_u = norm.get("product_url")
+        key_a = norm.get("bol_account") or norm.get("account")
+        if key_u:
+            seen: set[str] = set()
+            for i, row in enumerate(reader):
+                u = (row.get(key_u) or "").strip()
+                if not u.startswith("http"):
+                    continue
+                if u in seen:
+                    continue
+                seen.add(u)
+                acc_raw = (row.get(key_a) or "").strip() if key_a else ""
+                if acc_raw:
+                    try:
+                        an = int(float(acc_raw))
+                        an = min(3, max(1, an))
+                    except ValueError:
+                        an = min(3, i + 1)
+                else:
+                    an = min(3, i + 1)
+                out.append((u, an))
+            if out:
+                return out
     except csv.Error:
-        urls = []
+        pass
 
-    seen: set[str] = set()
-    loose: list[str] = []
+    seen2: set[str] = set()
+    loose: list[tuple[str, int]] = []
     for line in raw.splitlines():
         u = line.strip().strip('"').strip()
-        if u.lower().startswith(("http://", "https://")) and u not in seen:
-            seen.add(u)
-            loose.append(u)
+        if u.lower().startswith(("http://", "https://")) and u not in seen2:
+            seen2.add(u)
+            loose.append((u, min(3, len(loose) + 1)))
     return loose
 
 
-def write_product_urls(urls: list[str]) -> None:
+def read_product_urls_from_disk() -> list[str]:
+    return [u for u, _ in read_product_rows_from_disk()]
+
+
+def log_route_bol_accounts(parallel_cap: int) -> list[int]:
+    """
+    Same worker → bol_account mapping as browser_mode (first N http rows, capped).
+    Used so log tab labels and [SN] routing match session_N.json / EmailN (N is bol_account, not tab index).
+    """
+    pc = min(3, max(1, int(parallel_cap)))
+    rows = read_product_rows_from_disk()
+    if not rows:
+        return [min(3, i + 1) for i in range(pc)]
+    n = min(len(rows), pc)
+    accs: list[int] = []
+    for i in range(n):
+        j = min(i, len(rows) - 1)
+        accs.append(rows[j][1])
+    return accs
+
+
+def log_tabs_sorted_worker_order(accs: list[int]) -> tuple[list[int], dict[int, int]]:
+    """
+    Tabs left→right by **bol_account** (1, then 2, then 3) — not CSV row order.
+    Returns (worker_index_order_per_tab, bol_account → tab_index). Duplicate accounts share one tab index.
+    """
+    n = len(accs)
+    worker_order = sorted(range(n), key=lambda wi: accs[wi])
+    sid_to_tab: dict[int, int] = {}
+    for tab_i, wi in enumerate(worker_order):
+        sid_to_tab.setdefault(accs[wi], tab_i)
+    return worker_order, sid_to_tab
+
+
+def write_product_rows(rows: list[tuple[str, int]]) -> None:
     seen: set[str] = set()
-    ordered: list[str] = []
-    for u in urls:
+    ordered: list[tuple[str, int]] = []
+    for u, acc in rows:
         u = (u or "").strip()
         if not u.startswith("http") or u in seen:
             continue
         seen.add(u)
-        ordered.append(u)
+        try:
+            acc_n = int(acc)
+        except (TypeError, ValueError):
+            acc_n = 1
+        acc_n = min(3, max(1, acc_n))
+        ordered.append((u, acc_n))
     with PRODUCTS_PATH.open("w", encoding="utf-8-sig", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=["product_url"])
+        w = csv.DictWriter(f, fieldnames=["product_url", "bol_account"])
         w.writeheader()
-        for u in ordered:
-            w.writerow({"product_url": u})
+        for u, acc in ordered:
+            w.writerow({"product_url": u, "bol_account": str(acc)})
 
 
 class BolControlApp(tk.Tk):
@@ -188,11 +391,15 @@ class BolControlApp(tk.Tk):
         self._reader_thread: threading.Thread | None = None
         self._stop_reader = threading.Event()
         self._log_queue: queue.Queue[tuple[int, str]] = queue.Queue()
-        self._log_line_counts: list[int] = [0, 0, 0]
-        self._stdout_route_hint: list[int] = [0]
-        self._log_tabs: list[scrolledtext.ScrolledText] = []
-
         self._settings = _load_json_settings()
+        _lc = _parallel_slot_cap(self._settings)
+        self._log_line_counts: list[int] = [0] * _lc
+        self._stdout_route_hint: list[int] = [0]
+        self._log_route_bol_accounts: list[int] = []
+        self._log_sid_to_tab_idx: dict[int, int] = {}
+        self._log_tabs: list[scrolledtext.ScrolledText] = []
+        self._product_row_widgets: list[dict] = []
+        self._btn_add_product_row: ttk.Button | None = None
 
         self._build_ui()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -205,7 +412,6 @@ class BolControlApp(tk.Tk):
         self._reload_keywords_text()
         self._gui_log("Files loaded. Edit tabs → Save → Start bot.\n")
 
-    # ── UI ───────────────────────────────────────────────────────
 
     def _flat_btn(
         self,
@@ -253,7 +459,6 @@ class BolControlApp(tk.Tk):
         root = tk.Frame(self, bg=APP_BG, padx=14, pady=12)
         root.pack(fill=tk.BOTH, expand=True)
 
-        # — Header (title + status + actions) —
         header = tk.Frame(root, bg=APP_BG)
         self._header_frame = header
         header.pack(fill=tk.X, pady=(0, 10))
@@ -302,7 +507,6 @@ class BolControlApp(tk.Tk):
         self.btn_stop.pack(side=tk.LEFT, padx=4)
         self._flat_btn(right_head, "Clear log tab", self._clear_log, ACCENT_GRAY).pack(side=tk.LEFT, padx=4)
 
-        # — One vertical scroll (header fixed): Monitor + How it works, then Logs —
         body_outer = tk.Frame(root, bg=APP_BG)
         body_outer.pack(fill=tk.BOTH, expand=True)
 
@@ -326,7 +530,6 @@ class BolControlApp(tk.Tk):
 
         self._main_canvas.bind("<Configure>", _main_canvas_configure)
 
-        # Fixed height so tabs + help get predictable space; scroll down for full Logs.
         monitor_block = tk.Frame(main_inner, bg=APP_BG, height=460)
         monitor_block.pack(fill=tk.X, pady=(0, 8))
         monitor_block.pack_propagate(False)
@@ -375,37 +578,17 @@ class BolControlApp(tk.Tk):
         self._tab_settings()
         self._monitor_tab_select("products")
 
-        log_card = ttk.Labelframe(main_inner, text="Logs (Tab 1–3 ↔ slots 1–3)", padding=6)
-        log_card.pack(fill=tk.BOTH, expand=True, pady=(0, 4))
+        self._log_labelframe = ttk.Labelframe(main_inner, text="", padding=6)
+        self._log_labelframe.pack(fill=tk.BOTH, expand=True, pady=(0, 4))
 
-        inner_log = tk.Frame(log_card, bg=INNER_BG, highlightthickness=1, highlightbackground="#e5e7eb")
+        inner_log = tk.Frame(self._log_labelframe, bg=INNER_BG, highlightthickness=1, highlightbackground="#e5e7eb")
         inner_log.pack(fill=tk.BOTH, expand=True)
 
         self._log_notebook = ttk.Notebook(inner_log)
         self._log_notebook.pack(fill=tk.BOTH, expand=True)
 
-        log_kw = dict(
-            wrap=tk.NONE,
-            font=("Consolas", 9),
-            bg="#fafafa",
-            fg="#111827",
-            insertbackground="#111827",
-            relief=tk.FLAT,
-            padx=8,
-            pady=8,
-            height=20,
-        )
-        for i in range(3):
-            tab_fr = tk.Frame(self._log_notebook, bg=INNER_BG)
-            self._log_notebook.add(tab_fr, text=f" Tab {i + 1} ")
-            st = scrolledtext.ScrolledText(tab_fr, **log_kw)
-            st.pack(fill=tk.BOTH, expand=True)
-            st.configure(state=tk.DISABLED)
-            self._log_tabs.append(st)
+        self._populate_log_notebook_tabs(_parallel_slot_cap(self._settings))
 
-        self.log = self._log_tabs[0]
-
-        # Wheel: use winfo_containing + small-delta handling (trackpads often send |delta| < 120).
         self.bind_all("<MouseWheel>", self._route_mousewheel)
         self.bind_all("<Button-4>", self._route_mousewheel)
         self.bind_all("<Button-5>", self._route_mousewheel)
@@ -506,7 +689,6 @@ class BolControlApp(tk.Tk):
                     break
                 continue
 
-            # Monitor tab inner canvas (Session, Bot settings, …): wheel scrolls this pane, not the main page.
             if getattr(w, "_bol_tab_scroll", False) and isinstance(w, tk.Canvas):
                 if w.bbox("all"):
                     w.yview_scroll(int(d), "units")
@@ -564,7 +746,6 @@ class BolControlApp(tk.Tk):
         self.after_idle(self._sync_main_scrollregion)
 
     def _sync_main_scrollregion(self, _event=None) -> None:
-        """Keep embedded inner height in sync so the scrollbar reaches the real bottom."""
         try:
             self.update_idletasks()
             win = self._main_inner_win
@@ -580,7 +761,6 @@ class BolControlApp(tk.Tk):
             pass
 
     def _monitor_tab_footer_and_scroll(self, tab: tk.Frame) -> tuple[tk.Frame, tk.Frame]:
-        """Fixed footer (buttons always visible) + scrollable inner area above."""
         footer = tk.Frame(tab, bg=CARD_BG)
         footer.pack(side=tk.BOTTOM, fill=tk.X, pady=(2, 0))
         line = tk.Frame(tab, height=1, bg="#94a3b8", highlightthickness=0)
@@ -626,30 +806,44 @@ class BolControlApp(tk.Tk):
         ttk.Label(
             inner,
             text=(
-                f"Saved as {PRODUCTS_PATH.name} — one https URL per line "
-                "(or CSV with column product_url). Save after edits."
+                f"Saved as {PRODUCTS_PATH.name} — up to 3 https URLs; pick Bol login 1–3 per row "
+                "(Email1…Email3 in .env). **bol_account N** ↔ proxy line N ↔ session_N.json (not tied to row position)."
             ),
             font=("Segoe UI", 9),
             style="Monitor.TLabel",
+            wraplength=560,
         ).grid(row=0, column=0, sticky="ew", padx=4, pady=(0, 4))
 
-        self.txt_products = scrolledtext.ScrolledText(
-            inner,
-            height=10,
-            font=("Consolas", 9),
-            wrap=tk.NONE,
-            undo=True,
+        body = ttk.Frame(inner, style="Monitor.TFrame")
+        body.grid(row=1, column=0, sticky="nsew", padx=4, pady=4)
+        body.grid_columnconfigure(0, weight=1)
+
+        hdr = ttk.Frame(body, style="Monitor.TFrame")
+        hdr.grid(row=0, column=0, sticky="ew")
+        hdr.grid_columnconfigure(0, weight=1)
+        ttk.Label(hdr, text="Product URL", style="Monitor.TLabel").grid(
+            row=0, column=0, sticky="w"
         )
-        self.txt_products.grid(row=1, column=0, sticky="nsew", padx=4, pady=4)
+        ttk.Label(hdr, text="Login (.env)", style="Monitor.TLabel").grid(
+            row=0, column=1, sticky="w", padx=(12, 0)
+        )
+        ttk.Label(hdr, text="", style="Monitor.TLabel", width=4).grid(
+            row=0, column=2, sticky="e", padx=(6, 0)
+        )
+
+        self._product_rows_container = ttk.Frame(body, style="Monitor.TFrame")
+        self._product_rows_container.grid(row=1, column=0, sticky="ew", pady=(6, 0))
+        self._product_rows_container.grid_columnconfigure(0, weight=1)
 
         fr = ttk.Frame(footer, style="Monitor.TFrame")
         fr.pack(fill=tk.X, padx=2, pady=(2, 0))
         ttk.Button(fr, text="Save to product.csv", command=self._products_save).pack(
             side=tk.LEFT, padx=(0, 6)
         )
-        ttk.Button(fr, text="Import .txt (append new URLs)", command=self._products_import_txt).pack(
-            side=tk.LEFT, padx=(0, 6)
+        self._btn_add_product_row = ttk.Button(
+            fr, text="+ Add URL", command=self._products_add_row_click
         )
+        self._btn_add_product_row.pack(side=tk.LEFT, padx=(0, 6))
         self._register_monitor_tab("products", "Products", tab)
 
     def _tab_proxies(self) -> None:
@@ -673,7 +867,6 @@ class BolControlApp(tk.Tk):
         fr = ttk.Frame(footer, style="Monitor.TFrame")
         fr.pack(fill=tk.X, padx=2, pady=(2, 0))
         ttk.Button(fr, text="Save", command=self._proxies_save).pack(side=tk.LEFT, padx=(0, 6))
-        ttk.Button(fr, text="Import from file…", command=self._proxies_import).pack(side=tk.LEFT)
         self._register_monitor_tab("proxies", "Proxies", tab)
 
     def _tab_session(self) -> None:
@@ -686,7 +879,9 @@ class BolControlApp(tk.Tk):
             inner,
             text=(
                 "Login session (storage_state + proxy fingerprint).\n"
-                "session_<id>.json + session_<id>.fingerprint.txt (open in Notepad — hex + proxy hint)."
+                "session_<id>.json + session_<id>.fingerprint.txt + session_<id>.binding.json "
+                "(proxy + product/login binding + credential fingerprint).\n"
+                "Reset sessions — removes all of the above; list refreshes. Next Start = fresh logins (proxy.txt unchanged)."
             ),
             font=("Segoe UI", 9),
             style="Monitor.TLabel",
@@ -699,7 +894,7 @@ class BolControlApp(tk.Tk):
 
         fr = ttk.Frame(footer, style="Monitor.TFrame")
         fr.pack(fill=tk.X, padx=2, pady=(2, 0))
-        ttk.Button(fr, text="Refresh list", command=self._reload_session_tab).pack(side=tk.LEFT)
+        ttk.Button(fr, text="Reset sessions", command=self._sessions_reset_all).pack(side=tk.LEFT)
         self._register_monitor_tab("session", "Session", tab)
 
     def _tab_discord(self) -> None:
@@ -818,7 +1013,7 @@ class BolControlApp(tk.Tk):
         r = sec(r, "On / off")
         ttk.Checkbutton(
             inner,
-            text="Use proxy.txt (CSV ↔ proxy line ↔ session). Off = direct IP; same slot layout — each tab runs the full S1-style monitor + checkout flow.",
+            text="Use proxy.txt (bol_account N ↔ proxy line N ↔ session_N). Off = direct IP; same layout — full monitor + checkout per worker.",
             variable=self.var_use_proxies,
         ).grid(row=r, column=0, columnspan=2, sticky="w", padx=4, pady=2)
         r += 1
@@ -841,26 +1036,36 @@ class BolControlApp(tk.Tk):
             "Max Chromium BOL_BROWSER_MAX_PARALLEL (1–3)",
             "BOL_BROWSER_MAX_PARALLEL",
             4,
-            "All slot indices 1…N start together (N = min(rows, proxies, this cap)). Same code every tab — only "
-            "row N, proxy line N, session_n.json, and EmailN/PasswordN differ. To run fewer browsers, remove "
-            "extra CSV/proxy lines or lower this number — do not mix “only S3” with one window (that broke flow).",
+            "Up to N workers start (N = min(CSV http rows, this cap)). Same code every tab — each row's bol_account picks "
+            "proxy line + session + EmailN. Need proxy.txt line M if any row uses bol_account M. Lower this cap or "
+            "disable slot flags to run fewer windows.",
         )
 
         r = sec(r, "PDP polling — random delay each time (seconds)")
         r = hint(
             r,
-            "Between checks the bot sleeps a random value between min and max (uniform). "
-            "Online = PDP looks available / add-to-cart possible. Offline = errors, thin page, or offline.",
+            "Loaded PDP (page open): one pair of min/max for **all** monitoring — out of stock, Not available, waiting for "
+            "yellow ATC, and short ATC retries. Uniform random seconds between each poll.",
         )
         r = row(
             r,
-            "Online min BOL_BROWSER_POLL_ONLINE_MIN",
-            "BOL_BROWSER_POLL_ONLINE_MIN",
+            "Loaded PDP min BOL_BROWSER_POLL_OOS_MIN",
+            "BOL_BROWSER_POLL_OOS_MIN",
             8,
             None,
         )
-        r = row(r, "Online max BOL_BROWSER_POLL_ONLINE_MAX", "BOL_BROWSER_POLL_ONLINE_MAX", 8)
-        r = hint(r, "Typical range 2–5 s between polls when the listing looks buyable.")
+        r = row(r, "Loaded PDP max BOL_BROWSER_POLL_OOS_MAX", "BOL_BROWSER_POLL_OOS_MAX", 8)
+        r = hint(
+            r,
+            "Random delay between polls; **MIN is a hard floor** between PDP snapshots (same slot). Default 6–9 s.",
+        )
+        r = row(
+            r,
+            "Full reload every N polls BOL_BROWSER_FULL_RELOAD_EVERY_N_POLLS",
+            "BOL_BROWSER_FULL_RELOAD_EVERY_N_POLLS",
+            4,
+            "1 = every poll does page.goto (heavy). 3 = full reload every 3rd poll; others use light DOM (same stock logic).",
+        )
         r = row(
             r,
             "Offline min BOL_BROWSER_POLL_OFFLINE_MIN",
@@ -928,71 +1133,210 @@ class BolControlApp(tk.Tk):
         ttk.Button(fr, text="Save", command=self._settings_save_click).pack(side=tk.LEFT, padx=(0, 6))
         self._register_monitor_tab("settings", "Settings", tab)
 
-    # ── Products ─────────────────────────────────────────────────
+    def _bol_account_combo_labels(self) -> tuple[str, str, str]:
+        """Dropdown text only — masked emails; bol_account 1..3 is derived via `_account_num_from_combo_text`."""
+        env = _gui_load_env_map()
+        return (
+            _gui_mask_email_hint(_gui_pick_email_slot(env, 0)),
+            _gui_mask_email_hint(_gui_pick_email_slot(env, 1)),
+            _gui_mask_email_hint(_gui_pick_email_slot(env, 2)),
+        )
 
-    def _urls_from_products_editor(self) -> list[str]:
-        raw = self.txt_products.get("1.0", tk.END)
-        seen: set[str] = set()
-        out: list[str] = []
-        for line in raw.splitlines():
-            u = line.strip()
+    def _account_num_from_combo_text(self, display: str) -> int:
+        """Map visible combo string → bol_account column (1–3) for product.csv / bot."""
+        hints = self._bol_account_combo_labels()
+        d = (display or "").strip()
+        for i, h in enumerate(hints):
+            if d == (h or "").strip():
+                return i + 1
+        m = _ACCOUNT_COMBO_PREFIX_RE.match(d)
+        if m:
+            return min(3, max(1, int(m.group(1))))
+        env = _gui_load_env_map()
+        for slot in range(3):
+            full = (_gui_pick_email_slot(env, slot) or "").strip()
+            if full and d == full:
+                return slot + 1
+        return 1
+
+    def _combo_row_account(self, w: dict) -> int:
+        return self._account_num_from_combo_text(w["combo"].get())
+
+    def _refresh_product_account_combos(self) -> None:
+        """Every row may pick Email1/2/3 freely — **same account on multiple rows is OK** (parallel tabs share
+        session_N.json). We never silently rewrite row A to Email1 just because row B also chose Email3."""
+        labels = self._bol_account_combo_labels()
+        label_for = {1: labels[0], 2: labels[1], 3: labels[2]}
+        rows = self._product_row_widgets
+        all_accounts = (1, 2, 3)
+        vals = [label_for[a] for a in all_accounts]
+        for w in rows:
+            cur = self._combo_row_account(w)
+            cur = min(3, max(1, int(cur)))
+            cb = w["combo"]
+            cb.configure(values=vals)
+            cb.set(label_for[cur])
+
+    def _sync_add_url_button_state(self) -> None:
+        btn = self._btn_add_product_row
+        if btn is None:
+            return
+        if len(self._product_row_widgets) >= 3:
+            btn.state(["disabled"])
+        else:
+            btn.state(["!disabled"])
+
+    def _clear_product_rows(self) -> None:
+        for w in self._product_row_widgets:
+            w["frame"].destroy()
+        self._product_row_widgets.clear()
+        self._sync_add_url_button_state()
+
+    def _regrid_product_rows(self) -> None:
+        for i, w in enumerate(self._product_row_widgets):
+            w["frame"].grid(row=i, column=0, sticky="ew", pady=(0, 6))
+
+    def _remove_product_row(self, row: dict) -> None:
+        try:
+            self._product_row_widgets.remove(row)
+        except ValueError:
+            return
+        row["frame"].destroy()
+        self._regrid_product_rows()
+        self._sync_add_url_button_state()
+        self._refresh_product_account_combos()
+        if not self._product_row_widgets:
+            self._add_product_row("", 1)
+
+    def _add_product_row(self, url: str = "", account: int = 1) -> None:
+        if len(self._product_row_widgets) >= 3:
+            return
+        parent = self._product_rows_container
+        r = len(self._product_row_widgets)
+        fr = ttk.Frame(parent, style="Monitor.TFrame")
+        fr.grid(row=r, column=0, sticky="ew", pady=(0, 6))
+        fr.grid_columnconfigure(0, weight=1)
+
+        ent = ttk.Entry(fr, font=("Segoe UI", 9))
+        ent.grid(row=0, column=0, sticky="ew")
+        if url:
+            ent.insert(0, url)
+
+        labels = self._bol_account_combo_labels()
+        cb = ttk.Combobox(fr, width=52, state="readonly", values=list(labels))
+        cb.grid(row=0, column=1, padx=(8, 0), sticky="e")
+        cb.bind("<<ComboboxSelected>>", lambda _e: self._refresh_product_account_combos())
+
+        row_ref: dict = {"frame": fr, "entry": ent, "combo": cb}
+        del_btn = ttk.Button(
+            fr,
+            text="×",
+            width=3,
+            command=lambda rr=row_ref: self._remove_product_row(rr),
+        )
+        del_btn.grid(row=0, column=2, padx=(6, 0), sticky="e")
+        row_ref["del_btn"] = del_btn
+
+        self._product_row_widgets.append(row_ref)
+        self._sync_add_url_button_state()
+        self._refresh_product_account_combos()
+        want = min(3, max(1, int(account)))
+        vals = tuple(cb.cget("values"))
+        if labels[want - 1] in vals:
+            cb.set(labels[want - 1])
+            self._refresh_product_account_combos()
+
+    def _product_rows_from_editor(self) -> list[tuple[str, int]]:
+        out: list[tuple[str, int]] = []
+        for w in self._product_row_widgets:
+            u = w["entry"].get().strip()
             if not u.startswith("http"):
                 continue
-            if u in seen:
-                continue
-            seen.add(u)
-            out.append(u)
+            acc = self._combo_row_account(w)
+            out.append((u, acc))
         return out
 
     def _reload_products_list(self) -> None:
-        urls = read_product_urls_from_disk()
-        body = "\n".join(urls)
-        if body:
-            body += "\n"
-        self._set_text_widget(self.txt_products, body)
-        self._gui_log(f"Reloaded product editor ({len(urls)} URL(s)) from disk.\n")
+        rows = read_product_rows_from_disk()
+        self._clear_product_rows()
+        display = rows[:3]
+        if len(rows) > 3:
+            self._gui_log(
+                f"Reloaded products: {PRODUCTS_PATH.name} has {len(rows)} row(s); "
+                f"editor shows first 3 — Save overwrites file with those rows only.\n",
+            )
+        if not display:
+            self._add_product_row("", 1)
+            self._gui_log("Reloaded product editor (empty — one blank row).\n")
+            return
+        for u, acc in display:
+            self._add_product_row(u, acc)
+        self._refresh_product_account_combos()
+        self._gui_log(f"Reloaded product editor ({len(display)} URL row(s)) from disk.\n")
+
+    def _products_add_row_click(self) -> None:
+        if len(self._product_row_widgets) >= 3:
+            return
+        taken: set[int] = set()
+        for w in self._product_row_widgets:
+            taken.add(self._combo_row_account(w))
+        acc = next((a for a in (1, 2, 3) if a not in taken), 1)
+        self._add_product_row("", acc)
 
     def _products_save(self) -> None:
-        urls = self._urls_from_products_editor()
-        if not urls:
+        seen: set[str] = set()
+        ordered: list[tuple[str, int]] = []
+        for u, acc in self._product_rows_from_editor():
+            if u in seen:
+                continue
+            seen.add(u)
+            ordered.append((u, acc))
+        if not ordered:
             if not messagebox.askyesno(
                 "Empty",
-                "No lines starting with http. Save anyway? (will clear product.csv to header only.)",
+                "No rows with http URLs. Save anyway? (will clear product.csv to header only.)",
             ):
                 return
         try:
-            write_product_urls(urls)
+            write_product_rows(ordered)
         except OSError as e:
             messagebox.showerror("Save failed", str(e))
             return
-        self._gui_log(f"Saved {PRODUCTS_PATH.name} ({len(urls)} product URL(s)).\n")
+        self._gui_log(f"Saved {PRODUCTS_PATH.name} ({len(ordered)} product row(s)).\n")
 
-    def _products_import_txt(self) -> None:
-        path = filedialog.askopenfilename(
-            title="Import URLs",
-            filetypes=[("Text", "*.txt"), ("All", "*.*")],
+    def _sessions_reset_all(self) -> None:
+        if not messagebox.askyesno(
+            "Reset all sessions",
+            "Delete all saved browser session files in the cookies folder?\n\n"
+            "Next Start will ask for fresh login per session file. "
+            "proxy.txt is unchanged — bol_account N still maps to proxy line N.",
+        ):
+            return
+        patterns = (
+            "session_*.json",
+            "session_*.fingerprint.txt",
+            "session_*.binding.json",
+            "session_*.proxy.fp",
         )
-        if not path:
-            return
+        removed = 0
         try:
-            raw = Path(path).read_text(encoding="utf-8", errors="replace")
+            SESSION_DIR.mkdir(parents=True, exist_ok=True)
+            for pat in patterns:
+                for p in SESSION_DIR.glob(pat):
+                    try:
+                        p.unlink()
+                        removed += 1
+                    except OSError:
+                        pass
         except OSError as e:
-            messagebox.showerror("Read failed", str(e))
+            messagebox.showerror("Reset failed", str(e))
             return
-        existing = set(self._urls_from_products_editor())
-        block: list[str] = []
-        for line in raw.splitlines():
-            u = line.strip()
-            if u.startswith("http") and u not in existing:
-                existing.add(u)
-                block.append(u)
-        if not block:
-            messagebox.showinfo("Import", "No new http URLs in that file.")
-            return
-        insert = "\n".join(block) + "\n"
-        self.txt_products.insert(tk.END, insert)
-        self.txt_products.see(tk.END)
-        self._gui_log(f"Appended {len(block)} URL(s) from file (press Save to write CSV).\n")
+        self._reload_session_tab()
+        self._gui_log(f"Sessions reset: removed {removed} file(s) under {SESSION_DIR}.\n")
+        messagebox.showinfo(
+            "Sessions reset",
+            f"Removed {removed} file(s). Start the bot to log in again.",
+        )
 
     def _reload_session_tab(self) -> None:
         lines = [
@@ -1005,8 +1349,11 @@ class BolControlApp(tk.Tk):
             if SESSION_DIR.is_dir():
                 js = sorted(SESSION_DIR.glob("session_*.json"))
                 fps = sorted(SESSION_DIR.glob("session_*.fingerprint.txt"))
+                binds = sorted(SESSION_DIR.glob("session_*.binding.json"))
                 legacy = sorted(SESSION_DIR.glob("session_*.proxy.fp"))
-                all_files = sorted(set(js) | set(fps) | set(legacy), key=lambda x: x.name)
+                all_files = sorted(
+                    set(js) | set(fps) | set(binds) | set(legacy), key=lambda x: x.name
+                )
                 if all_files:
                     for p in all_files:
                         try:
@@ -1016,7 +1363,7 @@ class BolControlApp(tk.Tk):
                             lines.append(f"  • {p.name}")
                 else:
                     lines.append(
-                        "  (none yet — first Start creates session_<id>.json + session_<id>.fingerprint.txt)"
+                        "  (none yet — first Start creates session_<id>.json + fingerprint + binding sidecars)"
                     )
             else:
                 lines.append("  (folder created on first login save)")
@@ -1025,9 +1372,9 @@ class BolControlApp(tk.Tk):
         lines.extend(
             [
                 "",
-                "Reset login: Stop bot → delete session_*.json (+ session_*.fingerprint.txt) → Start.",
+                "Reset login: Stop bot → delete session_*.json (+ .fingerprint.txt + .binding.json) → Start.",
                 "",
-                "Env: BOL_BROWSER_MAX_PARALLEL (default 3) caps Chromium count; sessions session_1… from bind.",
+                "Env: BOL_BROWSER_MAX_PARALLEL caps workers; each bol_account N uses session_N.json (not “all session 1”).",
             ]
         )
         body = "\n".join(lines) + "\n"
@@ -1036,20 +1383,12 @@ class BolControlApp(tk.Tk):
         self.txt_session_info.insert("1.0", body)
         self.txt_session_info.configure(state=tk.DISABLED)
 
-    # ── Proxies / discord / keywords ───────────────────────────────
-
     def _reload_proxies_text(self) -> None:
         self._set_text_widget(self.txt_proxies, _read_text(PROXY_PATH))
 
     def _proxies_save(self) -> None:
         _write_text(PROXY_PATH, self.txt_proxies.get("1.0", tk.END))
         self._gui_log(f"Saved {PROXY_PATH.name}.\n")
-
-    def _proxies_import(self) -> None:
-        path = filedialog.askopenfilename(filetypes=[("Text", "*.txt"), ("All", "*.*")])
-        if path:
-            self._set_text_widget(self.txt_proxies, Path(path).read_text(encoding="utf-8", errors="replace"))
-            self._gui_log(f"Loaded proxies from {path} (not saved until you press Save).\n")
 
     def _reload_discord_fields(self) -> None:
         self.entry_discord_webhook.delete(0, tk.END)
@@ -1121,7 +1460,6 @@ class BolControlApp(tk.Tk):
     def _child_env(self) -> dict[str, str]:
         self._persist_settings_from_ui()
         env = os.environ.copy()
-        # Stable UTF-8 for 1.py on Windows (avoids cp1252 print / pipe issues).
         env["PYTHONUTF8"] = "1"
         env["PYTHONIOENCODING"] = "utf-8:replace"
         for k, v in self._settings.items():
@@ -1132,42 +1470,132 @@ class BolControlApp(tk.Tk):
         return env
 
     def _load_bol_logo_image(self) -> None:
-        try:
-            import urllib.request
+        label = self._bol_logo_label
 
-            url = "https://www.google.com/s2/favicons?domain=bol.com&sz=64"
-            req = urllib.request.Request(url, headers={"User-Agent": "BolMonitorGUI/1"})
-            with urllib.request.urlopen(req, timeout=6) as resp:
-                blob = resp.read()
-            self._bol_photo = tk.PhotoImage(data=blob)
-            self._bol_logo_label.configure(image=self._bol_photo)
-        except Exception:
-            self._bol_logo_label.configure(
+        def fallback() -> None:
+            label.configure(
                 text=" bol ",
                 font=("Segoe UI", 8, "bold"),
                 fg="white",
                 bg="#0064c8",
             )
 
-    # ── Log / bot process ─────────────────────────────────────────
+        def fetch() -> None:
+            blob: bytes | None = None
+            try:
+                import urllib.request
 
-    @staticmethod
-    def _stdout_line_tab_index(line: str, hint: list[int]) -> int:
-        """Map browser stdout line to log tab 0..2 from ``[Sn]`` or ``[SETUP] Slot n:``."""
+                url = "https://www.google.com/s2/favicons?domain=bol.com&sz=64"
+                req = urllib.request.Request(url, headers={"User-Agent": "BolMonitorGUI/1"})
+                with urllib.request.urlopen(req, timeout=6) as resp:
+                    blob = resp.read()
+            except Exception:
+                blob = None
+
+            def apply() -> None:
+                try:
+                    if blob:
+                        self._bol_photo = tk.PhotoImage(data=blob)
+                        label.configure(image=self._bol_photo)
+                    else:
+                        fallback()
+                except Exception:
+                    fallback()
+
+            try:
+                self.after(0, apply)
+            except tk.TclError:
+                pass
+
+        threading.Thread(target=fetch, daemon=True).start()
+
+    def _stdout_line_tab_index(self, line: str, hint: list[int]) -> int:
         s = line.rstrip("\r\n")
+        max_idx = max(0, len(self._log_tabs) - 1)
+        sid_map = getattr(self, "_log_sid_to_tab_idx", None) or {}
+
+        def route_by_bol_account(sid: int) -> int:
+            if sid in sid_map:
+                idx = min(max_idx, int(sid_map[sid]))
+                hint[0] = idx
+                return idx
+            idx = min(max_idx, sid - 1)
+            hint[0] = idx
+            return idx
+
         m = _LOG_SLOT_TAG_RE.match(s)
         if m:
-            sid = min(3, max(1, int(m.group(1))))
-            idx = sid - 1
-            hint[0] = idx
-            return idx
-        m = _LOG_SETUP_SLOT_LINE_RE.match(s)
+            return route_by_bol_account(max(1, int(m.group(1))))
+        m = _LOG_SETUP_BOL_ACCOUNT_RE.match(s)
         if m:
-            sid = min(3, max(1, int(m.group(1))))
-            idx = sid - 1
-            hint[0] = idx
-            return idx
-        return hint[0]
+            return route_by_bol_account(max(1, int(m.group(1))))
+        # Lines without a leading [Sn] still often name session_N.json or contain [Sn] mid-line — route by bol_account.
+        m = _LOG_BRACKET_S_ANYWHERE_RE.search(s)
+        if m:
+            return route_by_bol_account(max(1, int(m.group(1))))
+        m = _LOG_SESSION_JSON_RE.search(s)
+        if m:
+            return route_by_bol_account(max(1, int(m.group(1))))
+        return min(max_idx, hint[0])
+
+    def _populate_log_notebook_tabs(self, n_slots: int) -> None:
+        n_slots = min(3, max(1, int(n_slots)))
+        acc_route = log_route_bol_accounts(n_slots)
+        while len(acc_route) < n_slots:
+            acc_route.append(len(acc_route) + 1)
+        self._log_route_bol_accounts = acc_route[:n_slots]
+        _order, self._log_sid_to_tab_idx = log_tabs_sorted_worker_order(
+            self._log_route_bol_accounts
+        )
+        self._log_tab_acc_labels = [
+            self._log_route_bol_accounts[wi] for wi in _order
+        ]
+
+        log_hdr = (
+            f"Logs ({n_slots} tab{'s' if n_slots != 1 else ''} · "
+            "tabs left→Acc 1, Acc 2, Acc 3 — not product URL row order)"
+        )
+
+        if len(self._log_tabs) == n_slots:
+            for tab_pos, wi in enumerate(_order):
+                acc = self._log_route_bol_accounts[wi]
+                self._log_notebook.tab(tab_pos, text=f" Acc {acc} ")
+            self._log_tab_acc_labels = [
+                self._log_route_bol_accounts[wi] for wi in _order
+            ]
+            self._log_labelframe.configure(text=log_hdr)
+            return
+
+        for tid in list(self._log_notebook.tabs()):
+            tab = self._log_notebook.nametowidget(tid)
+            self._log_notebook.forget(tid)
+            tab.destroy()
+        self._log_tabs.clear()
+        self._log_line_counts = [0] * n_slots
+
+        log_kw = dict(
+            wrap=tk.NONE,
+            font=("Consolas", 9),
+            bg="#fafafa",
+            fg="#111827",
+            insertbackground="#111827",
+            relief=tk.FLAT,
+            padx=8,
+            pady=8,
+            height=20,
+        )
+        for tab_pos, wi in enumerate(_order):
+            acc = self._log_route_bol_accounts[wi]
+            tab_fr = tk.Frame(self._log_notebook, bg=INNER_BG)
+            self._log_notebook.add(tab_fr, text=f" Acc {acc} ")
+            st = scrolledtext.ScrolledText(tab_fr, **log_kw)
+            st.pack(fill=tk.BOTH, expand=True)
+            st.configure(state=tk.DISABLED)
+            self._log_tabs.append(st)
+
+        self.log = self._log_tabs[0]
+        self._stdout_route_hint[0] = 0
+        self._log_labelframe.configure(text=log_hdr)
 
     def _gui_log(self, text: str) -> None:
         t = text.rstrip("\n")
@@ -1176,7 +1604,9 @@ class BolControlApp(tk.Tk):
         self._log_queue.put((0, t + "\n"))
 
     def _append_log_tab(self, tab_idx: int, text: str) -> None:
-        tab_idx = min(2, max(0, tab_idx))
+        if not self._log_tabs:
+            return
+        tab_idx = min(len(self._log_tabs) - 1, max(0, tab_idx))
         w = self._log_tabs[tab_idx]
         w.configure(state=tk.NORMAL)
         w.insert(tk.END, text)
@@ -1191,17 +1621,21 @@ class BolControlApp(tk.Tk):
         w.configure(state=tk.DISABLED)
 
     def _clear_log(self) -> None:
+        if not self._log_tabs:
+            return
         try:
             idx = int(self._log_notebook.index(self._log_notebook.select()))
         except tk.TclError:
             idx = 0
-        idx = min(2, max(0, idx))
+        idx = min(len(self._log_tabs) - 1, max(0, idx))
         w = self._log_tabs[idx]
         w.configure(state=tk.NORMAL)
         w.delete("1.0", tk.END)
         self._log_line_counts[idx] = 0
         w.configure(state=tk.DISABLED)
-        self._gui_log(f"Log cleared (Tab {idx + 1}).\n")
+        acc_l = getattr(self, "_log_tab_acc_labels", []) or []
+        acc_h = acc_l[idx] if idx < len(acc_l) else idx + 1
+        self._gui_log(f"Log cleared (tab Acc {acc_h}).\n")
 
     def _drain_log_queue(self) -> None:
         try:
@@ -1221,6 +1655,32 @@ class BolControlApp(tk.Tk):
         self.btn_stop.configure(state=tk.NORMAL if running else tk.DISABLED)
         self.status_var.set("Bot: running" if running else "Bot: stopped")
 
+    def _log_start_binding_summary(self) -> None:
+        """Plain-language: which CSV bol_account → which session/proxy/email (parallel cap applied)."""
+        cap = _parallel_slot_cap(self._settings)
+        rows = read_product_rows_from_disk()
+        if not rows:
+            self._gui_log(
+                "product.csv has no http URLs — save Products tab first or bot will exit.\n",
+            )
+            return
+        n = min(len(rows), cap)
+        triples: list[tuple[int, str, int]] = []
+        for i in range(n):
+            j = min(i, len(rows) - 1)
+            url, acc = rows[j]
+            triples.append((acc, url, j))
+        if not _dotenv_file_truthy("BOL_BROWSER_WORKERS_CSV_ROW_ORDER"):
+            triples.sort(key=lambda t: (t[0], t[2]))
+        lines: list[str] = []
+        for wi, (acc, url, _) in enumerate(triples):
+            short = url if len(url) <= 52 else url[:49] + "…"
+            lines.append(
+                f"W{wi + 1}: **only Acc {acc}** → session_{acc}.json + proxy line {acc} + Email{acc} | {short}"
+            )
+        mode = "ONE Chromium (single)" if n == 1 else f"{n} Chromium windows (parallel)"
+        self._gui_log(f"{mode}. Row binding — {' · '.join(lines)}\n")
+
     def _start_bot(self) -> None:
         if self._proc is not None and self._proc.poll() is None:
             messagebox.showinfo("Already running", "Stop the bot first.")
@@ -1229,10 +1689,12 @@ class BolControlApp(tk.Tk):
             messagebox.showerror("Missing file", str(BOT_SCRIPT))
             return
         self._persist_settings_from_ui()
+        self._populate_log_notebook_tabs(_parallel_slot_cap(self._settings))
 
         self._stop_reader.clear()
         self._stdout_route_hint[0] = 0
-        self._gui_log("Starting 1.py ...\n")
+        self._log_start_binding_summary()
+        self._gui_log("Starting 1.py …\n")
 
         creationflags = 0
         if sys.platform == "win32":
@@ -1267,7 +1729,7 @@ class BolControlApp(tk.Tk):
                     if self._stop_reader.is_set():
                         break
                     if line:
-                        tab_i = BolControlApp._stdout_line_tab_index(line, self._stdout_route_hint)
+                        tab_i = self._stdout_line_tab_index(line, self._stdout_route_hint)
                         self._log_queue.put((tab_i, line))
             except Exception as e:
                 self._log_queue.put((0, f"\n[GUI] log reader error: {e}\n"))
@@ -1313,8 +1775,6 @@ class BolControlApp(tk.Tk):
                 return
             self._stop_bot()
         self.destroy()
-
-    # ── text helpers ─────────────────────────────────────────────
 
     def _set_text_widget(self, w: scrolledtext.ScrolledText, content: str) -> None:
         w.configure(state=tk.NORMAL)

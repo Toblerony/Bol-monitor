@@ -106,7 +106,7 @@ MAX_SUCCESSFUL_CHECKOUTS_PER_PRODUCT = 1
 IDEAL_SELECTION_ATTEMPTS = 3
 IDEAL_SELECTION_RETRY_DELAY_SECONDS = 0.25
 IDEAL_SELECTION_SETTLE_SECONDS = 0.25
-CSV_HEADERS = ("product_url",)
+CSV_HEADERS = ("product_url", "bol_account")
 CSV_LOCK = threading.Lock()
 BASKET_LOCK = threading.Lock()
 PURCHASE_FLOW_LOCK = threading.Lock()
@@ -1248,6 +1248,48 @@ def _product_csv_url_field(fieldnames: list[str] | None) -> str:
     return url_field
 
 
+def _product_csv_account_field_optional(fieldnames: list[str] | None) -> str | None:
+    normalized = {
+        name.strip().lstrip("\ufeff").lower(): name
+        for name in (fieldnames or [])
+        if name
+    }
+    for key in ("bol_account", "account", "bol_email_slot"):
+        k = normalized.get(key)
+        if k:
+            return k
+    return None
+
+
+def _parse_bol_account_cell(acc_raw: str, row_index: int) -> int:
+    """CSV bol_account: 1–3 maps to Email1…Email3. Default follows row order (capped at 3)."""
+    dft = min(3, max(1, row_index + 1))
+    s = (acc_raw or "").strip()
+    if not s:
+        return dft
+    try:
+        n = int(float(s))
+    except ValueError:
+        return dft
+    return min(3, max(1, n))
+
+
+def _session_pool_slot_index(product: dict, *, fallback_row_index: int, pool_len: int) -> int:
+    """Map CSV bol_account to SessionPool.slots index (0-based); clamp if pool smaller than account id."""
+    if pool_len <= 0:
+        return 0
+    acc = _parse_bol_account_cell(str(product.get("bol_account") or ""), fallback_row_index)
+    idx = acc - 1
+    idx = min(max(idx, 0), pool_len - 1)
+    if acc > pool_len:
+        print(
+            f"  [SESSION] bol_account={acc} exceeds session pool size ({pool_len}) — "
+            f"using index {idx} (same as browser: align pool rows with accounts).",
+            flush=True,
+        )
+    return idx
+
+
 def _http_urls_from_loose_product_csv(raw: str) -> list[str]:
     """Lines that look like product URLs when the file has no product_url header row."""
     seen: set[str] = set()
@@ -1260,12 +1302,12 @@ def _http_urls_from_loose_product_csv(raw: str) -> list[str]:
     return out
 
 
-def _write_products_csv_rows(filename: str, urls: list[str]) -> None:
+def _write_products_csv_rows(filename: str, rows: list[tuple[str, int]]) -> None:
     with open(filename, "w", encoding="utf-8-sig", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=CSV_HEADERS)
         writer.writeheader()
-        for url in urls:
-            writer.writerow({"product_url": url})
+        for url, acc in rows:
+            writer.writerow({"product_url": url, "bol_account": str(int(acc))})
 
 
 def ensure_products_csv(filename: str = PRODUCTS_FILE) -> None:
@@ -1285,27 +1327,37 @@ def ensure_products_csv(filename: str = PRODUCTS_FILE) -> None:
             except ValueError:
                 url_field = None
         if url_field:
-            urls = []
-            for row in reader:
+            account_field = _product_csv_account_field_optional(fieldnames)
+            rows_out: list[tuple[str, int]] = []
+            for row_index, row in enumerate(reader):
                 url = (row.get(url_field) or "").strip()
-                if url:
-                    urls.append(url)
-            if tuple(fieldnames) != CSV_HEADERS:
-                _write_products_csv_rows(filename, urls)
-                print(f"Normalized {PRODUCTS_FILE} to header: product_url")
+                if not url:
+                    continue
+                acc_cell = (
+                    (row.get(account_field) or "").strip()
+                    if account_field
+                    else ""
+                )
+                rows_out.append((url, _parse_bol_account_cell(acc_cell, row_index)))
+            fn_tuple = tuple(fieldnames)
+            need_norm = fn_tuple != CSV_HEADERS or account_field is None
+            if need_norm:
+                _write_products_csv_rows(filename, rows_out)
+                print(f"Normalized {PRODUCTS_FILE} to headers: product_url, bol_account")
             return
 
         loose = _http_urls_from_loose_product_csv(raw)
         if loose:
-            _write_products_csv_rows(filename, loose)
+            paired = [(u, min(3, i + 1)) for i, u in enumerate(loose)]
+            _write_products_csv_rows(filename, paired)
             print(
-                f"Normalized {PRODUCTS_FILE}: wrote {len(loose)} URL(s) with product_url header "
+                f"Normalized {PRODUCTS_FILE}: wrote {len(loose)} URL(s) with product_url + bol_account "
                 "(file had URLs but no CSV header row).",
             )
             return
 
         _write_products_csv_rows(filename, [])
-        print(f"Reset empty {PRODUCTS_FILE} with header: product_url")
+        print(f"Reset empty {PRODUCTS_FILE} with headers: product_url, bol_account")
         return
 
     urls = []
@@ -1313,11 +1365,12 @@ def ensure_products_csv(filename: str = PRODUCTS_FILE) -> None:
         with open(legacy_filename, "r", encoding="utf-8") as f:
             urls = [line.strip() for line in f if line.strip().startswith("http")]
 
-    _write_products_csv_rows(filename, urls)
+    legacy_rows = [(u, min(3, i + 1)) for i, u in enumerate(urls)]
+    _write_products_csv_rows(filename, legacy_rows)
     if urls:
         print(f"Migrated {len(urls)} product(s) from products.txt to {PRODUCTS_FILE}.")
     else:
-        print(f"Created empty {PRODUCTS_FILE} with header: product_url")
+        print(f"Created empty {PRODUCTS_FILE} with headers: product_url, bol_account")
 
 
 def load_products(filename: str = PRODUCTS_FILE) -> list[dict]:
@@ -1333,13 +1386,14 @@ def load_products(filename: str = PRODUCTS_FILE) -> list[dict]:
         url_rows = _http_urls_from_loose_product_csv(raw)
         products: list[dict] = []
         seen_urls: set[str] = set()
-        for url in url_rows:
+        for i, url in enumerate(url_rows):
             if url in seen_urls:
                 print(f"  [!] Skipping duplicate product URL: {url}")
                 continue
             seen_urls.add(url)
             products.append({
                 "product_url": url,
+                "bol_account": min(3, i + 1),
                 "offer_uid": None,
                 "last_checked_offer_uid": None,
                 "last_checked_seller_name": None,
@@ -1349,9 +1403,10 @@ def load_products(filename: str = PRODUCTS_FILE) -> list[dict]:
             })
         return products
 
+    account_field = _product_csv_account_field_optional(reader.fieldnames)
     products = []
     seen_urls = set()
-    for row in reader:
+    for row_index, row in enumerate(reader):
         url = (row.get(url_field) or "").strip()
         if not url:
             continue
@@ -1362,8 +1417,15 @@ def load_products(filename: str = PRODUCTS_FILE) -> list[dict]:
             print(f"  [!] Skipping duplicate product URL: {url}")
             continue
         seen_urls.add(url)
+        acc_cell = (
+            (row.get(account_field) or "").strip()
+            if account_field
+            else ""
+        )
+        bol_acc = _parse_bol_account_cell(acc_cell, row_index)
         products.append({
             "product_url": url,
+            "bol_account": bol_acc,
             "offer_uid": None,
             "last_checked_offer_uid": None,
             "last_checked_seller_name": None,
@@ -1419,7 +1481,7 @@ def append_product_url_to_csv_if_new(url: str) -> bool:
 
         with open(PRODUCTS_FILE, "a", encoding="utf-8-sig", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=CSV_HEADERS)
-            writer.writerow({"product_url": url})
+            writer.writerow({"product_url": url, "bol_account": "1"})
         SITEMAP_KNOWN_URLS.add(url)
         return True
 
@@ -1639,9 +1701,13 @@ def _start_product_workers(
 
     session_cursor_ref = None
     session_slot_arg = session_slot
-    if session_pool is not None and len(getattr(session_pool, "slots", []) or []) > 1:
-        session_cursor_ref = [(product_slot - 1) % len(session_pool.slots)]
-        worker_pm = session_pool.slots[session_cursor_ref[0]].pm
+    pool_slots = (getattr(session_pool, "slots", None) or []) if session_pool is not None else []
+    if session_pool is not None and len(pool_slots) > 1:
+        pi = _session_pool_slot_index(
+            product, fallback_row_index=product_slot - 1, pool_len=len(pool_slots)
+        )
+        session_cursor_ref = [pi]
+        worker_pm = pool_slots[pi].pm
         session_slot_arg = None
     else:
         worker_pm = session_slot.pm if session_slot is not None else pm
@@ -1910,18 +1976,16 @@ def _monitor_pick_pm_slot(
     session_cursor_ref: list[int] | None,
     slot_fallback,
 ):
-    """Returns (pm, slot_or_none) for this monitoring iteration."""
+    """Returns (pm, slot_or_none) for this monitoring iteration — pinned to bol_account slot (no cross-account fallback)."""
     if session_pool is None or session_cursor_ref is None or SESSIONS is None:
         return pm_arg, slot_fallback
     n = len(session_pool.slots)
     if n == 0:
         return pm_arg, slot_fallback
-    for _ in range(n):
-        idx = session_cursor_ref[0] % n
-        slot = session_pool.slots[idx]
-        if slot.state != SESSIONS.STATE_DEAD:
-            return slot.pm, slot
-        session_cursor_ref[0] = (session_cursor_ref[0] + 1) % n
+    idx = session_cursor_ref[0] % n
+    slot = session_pool.slots[idx]
+    if slot.state != SESSIONS.STATE_DEAD:
+        return slot.pm, slot
     return None, None
 
 
@@ -3733,22 +3797,21 @@ def monitor_url_bol_only(
     _pool_ref = session_pool
 
     def bump_session(reason: str) -> None:
-        """Only call on hard failure (HTTP blocked, dead proxy). Switches sticky pm+cookies — basket must not leak across slots."""
+        """Hard failure: clear basket only — stay on this product's bol_account pool slot (never hop to another account)."""
         if session_cursor_ref is None or _pool_ref is None:
             return
         n = len(_pool_ref.slots)
-        if n < 2:
+        if n < 1:
             return
-        session_cursor_ref[0] = (session_cursor_ref[0] + 1) % n
         idx = session_cursor_ref[0] % n
         sid = _pool_ref.slots[idx].slot_id
-        status(f"next session → {sid} ({reason})")
+        status(f"same session slot {sid} — cleared basket ({reason})")
         basket_ctx["basket_id"] = None
         basket_ctx["page_id"] = None
         basket_ctx["xsrf"] = None
 
     def rotate_for_proxy_error(exc: BaseException) -> None:
-        if session_cursor_ref is not None and _pool_ref is not None and len(_pool_ref.slots) > 1:
+        if session_cursor_ref is not None and _pool_ref is not None and len(_pool_ref.slots) >= 1:
             bump_session(str(exc)[:80])
             return
         if session_slot is not None:
@@ -4296,9 +4359,12 @@ def main():
                             continue
                         slot_kw = {}
                         if session_pool is not None:
-                            slot_kw["session_slot"] = session_pool.slot_for_index(
-                                next_product_slot - 1
+                            pi = _session_pool_slot_index(
+                                product,
+                                fallback_row_index=next_product_slot - 1,
+                                pool_len=len(session_pool.slots),
                             )
+                            slot_kw["session_slot"] = session_pool.slot_for_index(pi)
                             slot_kw["session_pool"] = session_pool
                         active_products[url] = _start_product_workers(
                             pm,
@@ -4513,9 +4579,12 @@ def run_parallel_main():
                             continue
                         slot_kw = {}
                         if session_pool is not None:
-                            slot_kw["session_slot"] = session_pool.slot_for_index(
-                                next_product_slot - 1
+                            pi = _session_pool_slot_index(
+                                product,
+                                fallback_row_index=next_product_slot - 1,
+                                pool_len=len(session_pool.slots),
                             )
+                            slot_kw["session_slot"] = session_pool.slot_for_index(pi)
                             slot_kw["session_pool"] = session_pool
                         active_products[url] = _start_product_workers(
                             pm,

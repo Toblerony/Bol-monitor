@@ -1,3 +1,0 @@
-# Extra proxies for browser-mode failover (same format as proxy.txt: host:port:user:pass).
-# On login/session break the bot clears cookies, picks the next non-cooling line here,
-# waits a few seconds, and logs in again — not used for normal offline PDP / IP-shell pages.

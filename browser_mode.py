@@ -1,26 +1,31 @@
 """
 Browser Mode (proxy-bound Playwright sessions).
-Up to **3** Chromium slots (``BOL_BROWSER_MAX_PARALLEL``, default 3); **each slot runs in its own thread with its own
-Chromium + Playwright instance** so long PDP/checkout work on one slot does not block others.
+Up to **3** Chromium workers (``BOL_BROWSER_MAX_PARALLEL``, default 3); **each worker runs in its own thread with its own
+Chromium + Playwright instance** so PDP/checkout work on one worker does not block others.
 
-CSV http URL order ↔ proxy.txt line index ↔ cookies/session_<n>.json + session_<n>.fingerprint.txt.
-Absolute slot index ``n``: S1=row1/session_1/Email1; enabling only S2 still uses ``session_2.json`` (see ``[BIND]`` logs).
-Failover pool ``proxies.txt``: extra identities when login/session breaks (cooldown + full reset) —
-not used for offline PDP / IP-shell monitoring.
-(sha256 hex + readable comment; legacy session_<n>.proxy.fp still read). Stale JSON removed when proxy line changes.
+**bol_account N** (from each CSV row’s ``bol_account`` column — not row position) binds **proxy.txt line N**,
+**cookies/session_N.json**,
+**session_N.fingerprint.txt**, and **session_N.binding.json** (product URL + bol_account + credential_fp from ``.env``).
+Row position does not override N — pick login 1–3 per row in the GUI / CSV. Parallel workers are ordered by
+``bol_account`` (S1 before S2 before S3) so the **Nth account's Chromium** lines up with **session_N** visually;
+set ``BOL_BROWSER_WORKERS_CSV_ROW_ORDER=1`` to restore strict CSV row → worker order.
 
-Up to 3 Chromium slots run **in parallel** — **one code path**: every enabled slot runs the same
-monitor → ATC → checkout flow as S1 (only credentials, proxy line, CSV row index, and cookie file differ).
-Credentials: slot 1 uses ``Email1``/``Password1`` (else legacy ``Email``/``Password``), slot 2 uses ``Email2``/``Password2``,
-slot 3 uses ``Email3``/``Password3`` (also ``BOL_EMAILn`` / ``BOL_PASSWORDn`` variants).
+Parallel workers writing the **same** ``session_N.json`` (e.g. repeat-last duplicate bol_account) share one disk lock so
+cookie saves are atomic and readers do not see torn JSON.
 
-By default **every** slot index ``0..n_resource-1`` starts (same code path). Set ``BOL_BROWSER_USE_SLOT_ENABLE_FLAGS=1`` to honor legacy ``BOL_BROWSER_ENABLE_SLOT_1``…``_3``.
-
-Each slot keeps the **product URL** captured at launch (``BOL_BROWSER_STICKY_SLOT_PRODUCT_URL`` default on) so later CSV edits do not retarget S2/S3. Proxy for slot N remains ``proxy.txt`` line N for the run (failover excepted). Set ``BOL_BROWSER_STICKY_SLOT_PRODUCT_URL=0`` to follow live CSV row order again.
+By default each account uses **only** ``proxy.txt`` line N (no hopping to other lines — those are usually other accounts).
+Set ``BOL_BROWSER_ALLOW_PROXY_FAILOVER_OTHER_LINES=1`` to rotate through spare lines after login loss or **Bol IP-geblokkeerd**
+pages (when ``BOL_BROWSER_FAILOVER_ON_IP_BLOCK`` is on, default). Authenticated proxies default to **launch**-level
+(``chromium.launch(proxy=…)``) to avoid Chromium **HTTP 407** on CONNECT; set ``BOL_BROWSER_PROXY_ON_CONTEXT=1`` to
+restore context-only proxy. ``BOL_BROWSER_STICKY_SLOT_PRODUCT_URL=1``
+freezes each worker's PDP URL to the launch snapshot; default ``0`` reloads ``product.csv`` and picks among rows whose
+``bol_account`` matches that worker (stable URL per worker slot when several rows share one account). Reordering CSV rows
+does not send one account's Chromium session to another account's product link. Same Playwright context stays sticky.
 """
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import random
 import re
@@ -35,6 +40,44 @@ from urllib.parse import urlparse
 
 class FailoverIdentityRestart(Exception):
     """Close Chromium context and retry with another proxy / clean cookies (browser mode only)."""
+
+
+class IpBlockFailoverRestart(FailoverIdentityRestart):
+    """IP-geblokkeerd page: rotate immediately and never reuse this tunnel again (this process + optional disk)."""
+
+
+def _failover_on_bol_access_blocked(use_proxy: bool) -> bool:
+    """When Bol serves HTTP 200 IP-geblokkeerd HTML, optionally reuse the browser failover path."""
+    if not use_proxy:
+        return False
+    if os.getenv("BOL_BROWSER_FAILOVER_ON_IP_BLOCK", "1").strip().lower() in (
+        "0",
+        "false",
+        "no",
+        "off",
+    ):
+        return False
+    return os.getenv("BOL_BROWSER_FAILOVER_ENABLED", "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
+    )
+
+
+_SESSION_STATE_LOCK_GUARD = threading.Lock()
+_SESSION_STATE_LOCKS: dict[str, threading.Lock] = {}
+
+
+def _session_state_io_lock(state_path: Path) -> threading.Lock:
+    """Serialize load/save for one session JSON — avoids torn reads/writes when threads share session_N.json."""
+    key = str(state_path.resolve())
+    with _SESSION_STATE_LOCK_GUARD:
+        lk = _SESSION_STATE_LOCKS.get(key)
+        if lk is None:
+            lk = threading.Lock()
+            _SESSION_STATE_LOCKS[key] = lk
+        return lk
 
 
 # NL storefront — human-like login starts here (guest → Inloggen), not a fast goto(login.bol.com).
@@ -143,6 +186,16 @@ def _load_bol_module():
 def _bol_credentials() -> tuple[str, str]:
     """Legacy single-account helper — same as slot 0 in `_bol_credentials_for_slot`."""
     return _bol_credentials_for_slot(0)
+
+
+def _bol_credentials_for_account_number(account_num: int) -> tuple[str, str]:
+    """Pick EmailN/PasswordN from bol_account column (1 → slot 0 … 3 → slot 2)."""
+    try:
+        n = int(account_num)
+    except (TypeError, ValueError):
+        n = 1
+    slot = min(2, max(0, n - 1))
+    return _bol_credentials_for_slot(slot)
 
 
 def _bol_credentials_for_slot(slot: int) -> tuple[str, str]:
@@ -269,6 +322,183 @@ def _session_fingerprint_legacy_fp_path(cookies_dir: Path, session_id: int) -> P
     return cookies_dir / f"session_{session_id}.proxy.fp"
 
 
+def _session_binding_json_path(cookies_dir: Path, session_id: int) -> Path:
+    """Records last product_url + bol_account this slot's cookies were validated against."""
+    return cookies_dir / f"session_{session_id}.binding.json"
+
+
+def _normalize_binding_product_url(url: str) -> str:
+    return (url or "").strip()
+
+
+def _credential_fingerprint(email: str, password: str) -> str:
+    """Stable hash of the login pair actually used for this slot (detect .env Email/Password edits)."""
+    raw = f"{(email or '').strip().casefold()}|{(password or '').strip()}".encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _read_session_binding(binding_path: Path) -> tuple[str, int, str | None] | None:
+    if not binding_path.is_file():
+        return None
+    try:
+        raw = binding_path.read_text(encoding="utf-8", errors="replace")
+        data = json.loads(raw)
+        u = _normalize_binding_product_url(str(data.get("product_url") or ""))
+        try:
+            acc = int(float(str(data.get("bol_account") or data.get("account") or "1")))
+        except (TypeError, ValueError):
+            acc = 1
+        acc = min(3, max(1, acc))
+        if not u.startswith("http"):
+            return None
+        cf_raw = str(data.get("credential_fp") or "").strip().lower()
+        cred_fp: str | None = None
+        if len(cf_raw) == 64 and all(c in "0123456789abcdef" for c in cf_raw):
+            cred_fp = cf_raw
+        return u, acc, cred_fp
+    except (OSError, ValueError, json.JSONDecodeError, TypeError):
+        return None
+
+
+def _write_session_binding(
+    binding_path: Path,
+    url: str,
+    account: int,
+    *,
+    credential_fp: str | None = None,
+) -> None:
+    u = _normalize_binding_product_url(url)
+    if not u.startswith("http"):
+        try:
+            binding_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return
+    acc = min(3, max(1, int(account)))
+    payload: dict = {"product_url": u, "bol_account": acc}
+    cf = (credential_fp or "").strip().lower()
+    if len(cf) == 64 and all(c in "0123456789abcdef" for c in cf):
+        payload["credential_fp"] = cf
+    body = json.dumps(payload, indent=2)
+    try:
+        binding_path.parent.mkdir(parents=True, exist_ok=True)
+        binding_path.write_text(body + "\n", encoding="utf-8")
+    except OSError as e:
+        print(f"[SESSION] binding file save failed: {e}", flush=True)
+
+
+def _binding_log_snippet(url: str, max_len: int = 64) -> str:
+    u = _normalize_binding_product_url(url)
+    if len(u) <= max_len:
+        return u
+    return u[: max_len - 1] + "…"
+
+
+def _sync_session_binding_for_slot(
+    *,
+    state_path: Path,
+    binding_path: Path,
+    fp_txt: Path,
+    legacy_fp: Path,
+    current_url: str,
+    current_account: int,
+    current_credential_fp: str,
+    session_id: int,
+    announce: bool,
+) -> None:
+    """
+    Session wipe only when **identity** changes: ``session_N.json`` must match bol_account N and the saved
+    credential fingerprint. **Product URL changes do not invalidate cookies** — binding file records the current CSV URL
+    for bookkeeping only (sticky Playwright context: same proxy + login, new PDP when you edit ``product.csv``).
+    Legacy binding without credential_fp → keep session once, then rewrite binding including fingerprint.
+    """
+    cur_u = _normalize_binding_product_url(current_url)
+    cur_a = min(3, max(1, int(current_account)))
+
+    if not state_path.is_file():
+        try:
+            binding_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return
+
+    stored = _read_session_binding(binding_path)
+
+    if cur_u.startswith("http"):
+        if stored is None:
+            # Missing/corrupt binding after proxy fingerprint already matched — repair sidecar; do not wipe cookies.
+            if announce:
+                print(
+                    f"[SETUP] session_{session_id}.json had no readable `{binding_path.name}` — "
+                    f"recreating binding for bol_account={cur_a} (cookies kept).",
+                    flush=True,
+                )
+            _write_session_binding(
+                binding_path,
+                cur_u,
+                cur_a,
+                credential_fp=current_credential_fp,
+            )
+            return
+        else:
+            su, sa, old_cf = stored
+            if int(sa) != int(cur_a):
+                try:
+                    state_path.unlink()
+                except OSError:
+                    pass
+                for p in (fp_txt, legacy_fp):
+                    try:
+                        if p.is_file():
+                            p.unlink()
+                    except OSError:
+                        pass
+                try:
+                    binding_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                if announce:
+                    print(
+                        f"[SETUP] bol_account mismatch — removed session_{session_id}.json "
+                        f"(binding had bol_account={sa}, this worker now uses bol_account={cur_a}). "
+                        "Re-login required.",
+                        flush=True,
+                    )
+                return
+            # ``su`` vs ``cur_u``: product URL may change freely — do not drop cookies.
+            if old_cf and old_cf != current_credential_fp:
+                try:
+                    state_path.unlink()
+                except OSError:
+                    pass
+                for p in (fp_txt, legacy_fp):
+                    try:
+                        if p.is_file():
+                            p.unlink()
+                    except OSError:
+                        pass
+                try:
+                    binding_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                if announce:
+                    print(
+                        f"[SETUP] .env login/password changed for bol_account={cur_a} (slot S{session_id}) — "
+                        f"removed session_{session_id}.json (saved cookies were for the previous credentials). "
+                        "Re-login required.",
+                        flush=True,
+                    )
+                return
+
+    if cur_u.startswith("http"):
+        _write_session_binding(
+            binding_path,
+            cur_u,
+            cur_a,
+            credential_fp=current_credential_fp,
+        )
+
+
 def _read_stored_proxy_fingerprint_hex(fp_txt: Path, legacy_fp: Path) -> str:
     """First sha256 line from .fingerprint.txt, else one-line hex from legacy .proxy.fp."""
     for p in (fp_txt, legacy_fp):
@@ -303,10 +533,13 @@ def _sync_session_file_with_proxy_fingerprint(
     session_id: int,
     hint: str,
     announce: bool = True,
+    announce_actions_only: bool = False,
 ) -> None:
     """
     Drop storage_state JSON if it was saved under a different proxy (or legacy without sidecar).
     Logs go to [SETUP] when ``announce`` is True (slots that launch Chromium this run).
+    If ``announce_actions_only``, only log when cookies/fingerprint files are removed — not
+    “matches” / “no session yet” (used when sweeping every proxy row before workers start).
     """
     for p in (fp_txt, legacy_fp):
         if p.is_file() and not state_path.is_file():
@@ -316,7 +549,7 @@ def _sync_session_file_with_proxy_fingerprint(
                 pass
 
     if not state_path.is_file():
-        if announce:
+        if announce and not announce_actions_only:
             print(
                 f"[SETUP] No saved session yet — will create {state_path.name} after login.",
                 flush=True,
@@ -344,7 +577,7 @@ def _sync_session_file_with_proxy_fingerprint(
         return
 
     if stored == current_fp:
-        if announce:
+        if announce and not announce_actions_only:
             print(
                 f"[SETUP] Session file matches current proxy fingerprint "
                 f"(session_{session_id}: {hint}).",
@@ -374,29 +607,61 @@ def _persist_storage_state(
     context,
     state_path: Path,
     fp_bundle: tuple[Path, str, str] | None,
+    *,
+    binding_url: str | None = None,
+    binding_account: int | None = None,
+    binding_credential_fp: str | None = None,
 ) -> None:
-    try:
-        context.storage_state(path=str(state_path))
-    except Exception as e:
-        print(f"[SESSION] save cookies: {e}", flush=True)
-        return
-    if not fp_bundle:
-        return
-    fp_txt, fp_hex, hint = fp_bundle
-    legacy_fp = _session_fingerprint_legacy_fp_path(fp_txt.parent, _session_id_from_session_json_path(state_path))
-    body = (
-        f"{fp_hex}\n"
-        f"# sha256(host:port:user:pass) for this session's proxy.txt line — {hint}\n"
-    )
-    try:
-        fp_txt.write_text(body, encoding="utf-8")
-        if legacy_fp.is_file():
-            try:
-                legacy_fp.unlink()
-            except OSError:
-                pass
-    except OSError as e:
-        print(f"[SESSION] fingerprint file save failed: {e}", flush=True)
+    lk = _session_state_io_lock(state_path)
+    with lk:
+        tmp: Path | None = state_path.parent / (
+            f".{state_path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+        )
+        try:
+            context.storage_state(path=str(tmp))
+            os.replace(tmp, state_path)
+            tmp = None
+        except Exception as e:
+            print(f"[SESSION] save cookies: {e}", flush=True)
+            if tmp is not None:
+                try:
+                    tmp.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            return
+        if not fp_bundle:
+            return
+        fp_txt, fp_hex, hint = fp_bundle
+        legacy_fp = _session_fingerprint_legacy_fp_path(
+            fp_txt.parent, _session_id_from_session_json_path(state_path)
+        )
+        body = (
+            f"{fp_hex}\n"
+            f"# sha256(host:port:user:pass) for this session's tunnel — {hint}\n"
+        )
+        try:
+            fp_txt.write_text(body, encoding="utf-8")
+            if legacy_fp.is_file():
+                try:
+                    legacy_fp.unlink()
+                except OSError:
+                    pass
+        except OSError as e:
+            print(f"[SESSION] fingerprint file save failed: {e}", flush=True)
+
+        if (
+            binding_url is not None
+            and binding_account is not None
+            and _normalize_binding_product_url(binding_url).startswith("http")
+        ):
+            sid = _session_id_from_session_json_path(state_path)
+            bp = _session_binding_json_path(state_path.parent, sid)
+            _write_session_binding(
+                bp,
+                binding_url,
+                int(binding_account),
+                credential_fp=binding_credential_fp,
+            )
 
 
 def _session_id_from_session_json_path(state_path: Path) -> int:
@@ -405,9 +670,10 @@ def _session_id_from_session_json_path(state_path: Path) -> int:
     return int(m.group(1)) if m else 1
 
 
-def _pause_online_duration() -> float:
-    lo = float(os.getenv("BOL_BROWSER_POLL_ONLINE_MIN", "2"))
-    hi = float(os.getenv("BOL_BROWSER_POLL_ONLINE_MAX", "5"))
+def _pause_oos_monitor_duration() -> float:
+    """Seconds between polls when PDP is **loaded** (online shell): OOS / Not available / waiting for ATC — same delay."""
+    lo = float(os.getenv("BOL_BROWSER_POLL_OOS_MIN", "6"))
+    hi = float(os.getenv("BOL_BROWSER_POLL_OOS_MAX", "9"))
     if hi < lo:
         lo, hi = hi, lo
     return random.uniform(lo, hi)
@@ -421,12 +687,37 @@ def _pause_offline_duration() -> float:
     return random.uniform(lo, hi)
 
 
-def _pause_online() -> None:
-    time.sleep(_pause_online_duration())
-
-
 def _pause_offline() -> None:
     time.sleep(_pause_offline_duration())
+
+
+_PDP_POLL_LAST_MONO: dict[int, float] = {}
+_PDP_POLL_MONO_LOCK = threading.Lock()
+
+
+def _enforce_pdp_poll_min_gap(slot_id: int | None) -> None:
+    """Guarantee at least ``BOL_BROWSER_POLL_OOS_MIN`` seconds between PDP snapshots (per Chromium slot)."""
+    if slot_id is None:
+        return
+    try:
+        lo = float(os.getenv("BOL_BROWSER_POLL_OOS_MIN", "6"))
+    except ValueError:
+        lo = 6.0
+    lo = max(0.0, lo)
+    with _PDP_POLL_MONO_LOCK:
+        last = _PDP_POLL_LAST_MONO.get(slot_id)
+        now = time.monotonic()
+        if last is not None:
+            elapsed = now - last
+            if elapsed < lo:
+                time.sleep(lo - elapsed)
+
+
+def _mark_pdp_poll_spacing_end(slot_id: int | None) -> None:
+    if slot_id is None:
+        return
+    with _PDP_POLL_MONO_LOCK:
+        _PDP_POLL_LAST_MONO[slot_id] = time.monotonic()
 
 
 def _parse_all_proxy_lines(proxy_file: Path) -> list[tuple[str, str, str, str]]:
@@ -449,7 +740,27 @@ def _parse_all_proxy_lines(proxy_file: Path) -> list[tuple[str, str, str, str]]:
     return out
 
 
-DEFAULT_FAILOVER_POOL_FILE = "proxies.txt"
+def _effective_browser_proxy_rows(
+    proxy_file: Path,
+    *,
+    use_proxy: bool,
+) -> list[tuple[str, str, str, str]]:
+    """Valid ``host:port:user:pass`` rows from ``proxy.txt`` in file order (line N → bol_account N)."""
+    if not use_proxy:
+        return []
+    return _parse_all_proxy_lines(proxy_file)
+
+
+def _proxy_primary_label(slot_1based: int, use_proxy: bool) -> str:
+    if not use_proxy:
+        return "direct (USE_PROXIES=0)"
+    return f"proxy.txt line {slot_1based}"
+
+
+def _proxy_slot_short_label(acc_n: int, use_proxy: bool) -> str:
+    if not use_proxy:
+        return "direct"
+    return f"line[{acc_n}]"
 
 
 class ProxyCooldownRegistry:
@@ -457,6 +768,7 @@ class ProxyCooldownRegistry:
 
     _lock = threading.Lock()
     _until: dict[str, float] = {}
+    _permanent_ban: set[str] = set()
 
     @classmethod
     def mark(cls, host: str, port: str, user: str, password: str, seconds: float) -> None:
@@ -464,6 +776,19 @@ class ProxyCooldownRegistry:
         until = time.time() + max(1.0, float(seconds))
         with cls._lock:
             cls._until[fp] = max(cls._until.get(fp, 0.0), until)
+
+    @classmethod
+    def ban_permanent(cls, host: str, port: str, user: str, password: str) -> None:
+        """Bol IP-geblokkeerd / abuse IP — never pick this tunnel again in this process."""
+        fp = _proxy_tuple_fingerprint(host, port, user, password)
+        with cls._lock:
+            cls._permanent_ban.add(fp)
+
+    @classmethod
+    def is_permanently_banned(cls, host: str, port: str, user: str, password: str) -> bool:
+        fp = _proxy_tuple_fingerprint(host, port, user, password)
+        with cls._lock:
+            return fp in cls._permanent_ban
 
     @classmethod
     def cooling_remaining(cls, host: str, port: str, user: str, password: str) -> float:
@@ -480,32 +805,42 @@ class ProxyCooldownRegistry:
     def min_remaining_chain(cls, chain: list[tuple[str, str, str, str]]) -> float:
         if not chain:
             return 0.0
-        return min(
-            (cls.cooling_remaining(*t) for t in chain),
-            default=0.0,
-        )
+        remain: list[float] = []
+        for t in chain:
+            if cls.is_permanently_banned(*t):
+                continue
+            remain.append(cls.cooling_remaining(*t))
+        if not remain:
+            return float("inf")
+        return min(remain)
 
 
-def _ensure_failover_pool_file(path: Path) -> None:
-    if path.is_file():
-        return
-    try:
-        path.write_text(
-            "# Extra proxies for browser-mode failover (same format as proxy.txt: host:port:user:pass).\n"
-            "# On login/session break the bot clears cookies, picks the next non-cooling line here,\n"
-            "# waits a few seconds, and logs in again — not used for normal offline PDP / IP-shell pages.\n",
-            encoding="utf-8",
-        )
-    except OSError:
-        pass
-
-
-def _unique_proxy_chain(
-    primary: tuple[str, str, str, str], pool: list[tuple[str, str, str, str]]
+def _proxy_failover_chain_for_bol_account(
+    bol_account_num: int,
+    proxy_rows: list[tuple[str, str, str, str]],
+    *,
+    allow_other_lines: bool,
 ) -> list[tuple[str, str, str, str]]:
+    """
+    Primary tunnel for **bol_account** ``bol_account_num`` (1→``proxy_rows[0]``, 2→``[1]``, …).
+    CSV row order does not affect this — only the account number bound to that Chromium worker.
+
+    If ``allow_other_lines``: append every other ``proxy.txt`` row for failover (deduped by fingerprint).
+    Else: **primary only** — sticky proxy/session for that account.
+    """
+    if not proxy_rows:
+        return []
+    idx = min(max(0, int(bol_account_num) - 1), len(proxy_rows) - 1)
+    primary = proxy_rows[idx]
+    if not allow_other_lines:
+        return [primary]
+    ordered = [primary]
+    for i, row in enumerate(proxy_rows):
+        if i != idx:
+            ordered.append(row)
     seen: set[str] = set()
     out: list[tuple[str, str, str, str]] = []
-    for t in (primary, *pool):
+    for t in ordered:
         fp = _proxy_tuple_fingerprint(*t)
         if fp in seen:
             continue
@@ -521,20 +856,91 @@ def _pick_live_proxy_index(
     for step in range(n):
         idx = (start_idx + step) % n
         t = chain[idx]
+        if ProxyCooldownRegistry.is_permanently_banned(*t):
+            continue
         if not ProxyCooldownRegistry.is_cooling(*t):
             return idx, t
     return None
 
 
+def _env_remove_ip_blocked_line_from_proxy_txt() -> bool:
+    return os.getenv("BOL_BROWSER_REMOVE_IP_BLOCKED_PROXY_FROM_TXT", "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
+    )
+
+
+def _remove_proxy_txt_line_matching_row(
+    proxy_file: Path, row: tuple[str, str, str, str], sp: str
+) -> bool:
+    """Drop the first file line whose host:port:user:pass fingerprint matches ``row``."""
+    target = _proxy_tuple_fingerprint(*row)
+    try:
+        raw = proxy_file.read_text(encoding="utf-8", errors="replace")
+    except OSError as e:
+        print(
+            f"{sp}[FAILOVER] Could not read {proxy_file.name} to remove IP-blocked line: {e}",
+            flush=True,
+        )
+        return False
+    out_lines: list[str] = []
+    removed = False
+    for line in raw.splitlines():
+        scrubbed = _scrub_proxy_txt_line_raw(line)
+        if not scrubbed or scrubbed.startswith("#"):
+            out_lines.append(line)
+            continue
+        parts = scrubbed.split(":")
+        if len(parts) != 4:
+            out_lines.append(line)
+            continue
+        tup = (
+            parts[0].strip(),
+            parts[1].strip(),
+            parts[2].strip(),
+            parts[3].strip(),
+        )
+        if _proxy_tuple_fingerprint(*tup) == target:
+            if not removed:
+                removed = True
+                print(
+                    f"{sp}[FAILOVER] Removed IP-blocked tunnel from {proxy_file.name} "
+                    f"(one line; **bol_account ↔ line index may shift on next app start** — check CSV/bind).",
+                    flush=True,
+                )
+            continue
+        out_lines.append(line)
+    if not removed:
+        return False
+    try:
+        proxy_file.write_text(
+            "\n".join(out_lines) + ("\n" if out_lines else ""),
+            encoding="utf-8",
+        )
+    except OSError as e:
+        print(
+            f"{sp}[FAILOVER] Could not write {proxy_file.name} after line removal: {e}",
+            flush=True,
+        )
+        return False
+    return True
+
+
 def _clear_slot_session_storage(
     state_path: Path, fp_txt: Path, legacy_fp: Path, sp: str
 ) -> None:
-    for p in (state_path, fp_txt, legacy_fp):
-        try:
-            if p.is_file():
-                p.unlink()
-        except OSError as e:
-            print(f"{sp}[FAILOVER] Could not remove {p.name}: {e}", flush=True)
+    lk = _session_state_io_lock(state_path)
+    with lk:
+        sid = _session_id_from_session_json_path(state_path)
+        binding = _session_binding_json_path(state_path.parent, sid)
+        for p in (state_path, fp_txt, legacy_fp, binding):
+            try:
+                if p.is_file():
+                    p.unlink()
+            except OSError as e:
+                print(f"{sp}[FAILOVER] Could not remove {p.name}: {e}", flush=True)
 
 
 def _failover_relogin_delay_sec() -> float:
@@ -720,6 +1126,23 @@ def _ordered_http_products(products: list) -> list[tuple[dict, str]]:
     return rows
 
 
+def _product_bol_account_number(product_dict: dict | None, row_index: int) -> int:
+    """Which Bol login pair (1–3) this CSV row uses for browser mode."""
+    dft = min(3, max(1, row_index + 1))
+    if not product_dict:
+        return dft
+    raw = product_dict.get("bol_account")
+    if raw is None:
+        raw = product_dict.get("account")
+    if raw is not None and str(raw).strip() != "":
+        try:
+            n = int(float(str(raw).strip()))
+            return min(3, max(1, n))
+        except (ValueError, TypeError):
+            pass
+    return dft
+
+
 def _load_ordered_http_products_retry(mod, *, phase: str) -> tuple[list[tuple[dict, str]], str | None]:
     """
     Retry when ``product.csv`` is briefly unreadable (OneDrive sync / Excel lock). Without this,
@@ -750,35 +1173,56 @@ def _load_ordered_http_products_retry(mod, *, phase: str) -> tuple[list[tuple[di
 
 
 def _sticky_slot_product_url_default() -> bool:
-    """When True (default), each Chromium keeps the product URL bound at process start — CSV edits do not retarget slots."""
-    return os.getenv("BOL_BROWSER_STICKY_SLOT_PRODUCT_URL", "1").strip().lower() not in (
-        "0",
-        "false",
-        "no",
-        "off",
-    )
+    """When True, each worker keeps the PDP URL captured at process start. Default False → live CSV updates retarget monitoring."""
+    v = os.getenv("BOL_BROWSER_STICKY_SLOT_PRODUCT_URL", "0").strip().lower()
+    return v in ("1", "true", "yes", "on")
 
 
-def _pick_slot_product_url(
-    slot: int,
+def _urls_for_bol_account(
+    bol_account: int, ordered_rows: list[tuple[dict, str]]
+) -> list[str]:
+    """All http URLs from rows whose bol_account matches (CSV top-to-bottom order)."""
+    acc = min(3, max(1, int(bol_account)))
+    out: list[str] = []
+    for i, (row_dict, u) in enumerate(ordered_rows):
+        if _product_bol_account_number(row_dict, i) != acc:
+            continue
+        s = (u or "").strip()
+        if s:
+            out.append(s)
+    return out
+
+
+def _pick_product_url_for_bol_account(
+    bol_account: int,
     ordered_rows: list[tuple[dict, str]],
-    slot_http_urls: list[str],
     *,
+    slot: int,
+    slot_http_urls: list[str],
     sticky: bool,
+    url_pick_index: int | None = None,
 ) -> str:
     """
-    ``sticky=True``: always the startup snapshot for this slot (proxy line N ↔ URL N at launch).
-    ``sticky=False``: follow live CSV row order (legacy — adding rows above shifts slot targets).
+    PDP URL for this worker's bound ``bol_account`` (``session_N.json`` / proxy line N).
+
+    ``sticky=True``: launch snapshot for this worker index (W1/W2 array order at start).
+    ``sticky=False``: rows matching ``bol_account`` in CSV order; ``url_pick_index`` picks
+    ``matches[min(url_pick_index, len(matches)-1)]`` so two workers on the same account get distinct URLs.
+    When ``url_pick_index`` is None, ``slot`` is used (legacy CSV-row worker order).
     """
+    acc = min(3, max(1, int(bol_account)))
+    pick = int(slot if url_pick_index is None else url_pick_index)
     if sticky:
         if slot < len(slot_http_urls) and (slot_http_urls[slot] or "").strip():
             return (slot_http_urls[slot] or "").strip()
-        if slot < len(ordered_rows):
-            return (ordered_rows[slot][1] or "").strip()
-        return ""
-    if slot < len(ordered_rows):
-        return (ordered_rows[slot][1] or "").strip()
-    if slot < len(slot_http_urls):
+        m = _urls_for_bol_account(acc, ordered_rows)
+        if not m:
+            return ""
+        return m[min(pick, len(m) - 1)]
+    m = _urls_for_bol_account(acc, ordered_rows)
+    if m:
+        return m[min(pick, len(m) - 1)]
+    if slot < len(slot_http_urls) and (slot_http_urls[slot] or "").strip():
         return (slot_http_urls[slot] or "").strip()
     return ""
 
@@ -796,6 +1240,13 @@ def _html_looks_like_bol_oops_not_found(html: str) -> bool:
     if "oeps" in lc and "pagina niet gevonden" in lc:
         return True
     if "pagina niet gevonden" in lc and "naar de homepage" in lc:
+        return True
+    # EN storefront \"sorry … could(n't) not find … page\" — stay **offline** monitor only (no proxy rotate).
+    if "sorry" in lc and "couldn't find" in lc:
+        return True
+    if "sorry" in lc and "could not find" in lc and "page" in lc:
+        return True
+    if "we couldn't find" in lc or "we could not find" in lc:
         return True
     return False
 
@@ -1127,6 +1578,7 @@ def _reset_to_nl_storefront(page, *, sp: str) -> None:
         if _nl_storefront_privacy_dialog_visible(page):
             _dismiss_cookie_wall(page)
             time.sleep(0.22)
+        _dismiss_nl_storefront_privacy(page)
         return
 
     print(f"{sp}[MONITOR] Opening NL storefront before product URLs…", flush=True)
@@ -1146,6 +1598,7 @@ def _reset_to_nl_storefront(page, *, sp: str) -> None:
         _dismiss_cookie_wall(page)
         time.sleep(0.35)
         _dismiss_cookie_wall(page)
+        _dismiss_nl_storefront_privacy(page)
         _ensure_nl_storefront_shell_ready(page)
     except Exception as e:
         print(f"{sp}[MONITOR] storefront reset: {e}", flush=True)
@@ -1164,6 +1617,16 @@ def _login_debug_line(page) -> str:
     except Exception:
         t = "(title unavailable — navigating?)"
     return f"url={u!r} title≈{t!r}"
+
+
+def _playwright_target_closed(exc: BaseException) -> bool:
+    """Mid-login tab/browser loss (residential proxy drops, Bol navigation) — not a normal form miss."""
+    if type(exc).__name__ == "TargetClosedError":
+        return True
+    low = str(exc).lower()
+    return "has been closed" in low and any(
+        x in low for x in ("target", "browser", "context", "page")
+    )
 
 
 def _fill_login_in_frame(
@@ -1627,7 +2090,9 @@ def _goto_with_retries(
     # NL storefront home: **domcontentloaded first** — same usable shell for new proxy (no cookies)
     # and reused session; avoids \"commit\" returning before DOM/header exist (felt like a hang on bol.com/nl/nl).
     if storefront_nl:
-        wait_modes = ("domcontentloaded", "commit", "load")
+        # Never use ``load`` here — Bol's home pulls long-lived trackers; ``load`` often hits the full
+        # timeout and feels like an infinite \"homepage loading\" hang (especially on residential proxies).
+        wait_modes = ("domcontentloaded", "commit", "domcontentloaded")
         try:
             cap = int(os.getenv("BOL_BROWSER_STOREFRONT_GOTO_TIMEOUT_MS", "70000"))
             timeout_ms = min(timeout_ms, max(25000, cap))
@@ -1775,7 +2240,14 @@ def _nl_storefront_home_usable(page) -> bool:
         n = int(os.getenv("BOL_BROWSER_HOME_USABLE_MIN_HTML_CHARS", "32000"))
         if n < 8000:
             n = 8000
-        return len(page.content() or "") >= n
+        # Avoid ``page.content()`` — full HTML serialization can block a long time while the shell paints.
+        sz = int(
+            page.evaluate(
+                "() => Math.min(600000, document.documentElement "
+                "? document.documentElement.outerHTML.length : 0)"
+            )
+        )
+        return sz >= n
     except Exception:
         return False
 
@@ -1855,7 +2327,15 @@ def _browser_login_fill_submit_and_confirm(page, email: str, password: str) -> b
             "[LOGIN] Fields not detected within timeout — trying fill anyway (slow proxy / layout).",
         )
 
-    ok_fill = _try_fill_login_form(page, email, password)
+    try:
+        ok_fill = _try_fill_login_form(page, email, password)
+    except Exception as e:
+        if _playwright_target_closed(e):
+            _lprint(
+                "[LOGIN] Page/browser closed while filling login (proxy/network) — aborting this attempt.",
+            )
+            raise
+        ok_fill = False
     if not ok_fill:
         _lprint(f"[LOGIN] Could not find email/password fields. {_login_debug_line(page)}")
         wait_manual = float(os.getenv("BOL_BROWSER_MANUAL_LOGIN_SEC", "90"))
@@ -1940,12 +2420,46 @@ def _browser_login_via_homepage(
         _lprint("[LOGIN] Session recognized after pause — skipping Inloggen / WSP.")
         return True
 
-    clicked = _click_storefront_inloggen(page)
-    if not clicked:
-        _dismiss_nl_storefront_privacy(page)
-        _ensure_nl_storefront_dom_ready(page)
-        _micro_pause_after_nl_shell_ready()
+    # Prefer storefront Inloggen (stable). WSP direct tab often flakes on slow residential IPs
+    # (TargetClosedError mid-fill) when CMP/header hydrates late.
+    clicked = False
+    attempts = max(1, int(os.getenv("BOL_BROWSER_INLOGGEN_ATTEMPTS_BEFORE_WSP", "4")))
+    reload_at = (attempts // 2) if attempts >= 2 else -1
+    for attempt in range(attempts):
+        if attempt > 0:
+            _lprint(
+                f"[LOGIN] Inloggen link not clicked — retry {attempt + 1}/{attempts} "
+                f"(stay on bol.com homepage; avoids fragile login.bol.com tab).",
+            )
+            _dismiss_nl_storefront_privacy(page)
+            _ensure_nl_storefront_dom_ready(page)
+            _ensure_nl_storefront_shell_ready(page)
+            _micro_pause_after_nl_shell_ready()
+            time.sleep(random.uniform(0.35, 0.95))
+        if _logged_in_for_homepage_flow(page):
+            _lprint("[LOGIN] Session recognized during Inloggen retries.")
+            return True
+        if attempt == reload_at:
+            try:
+                _lprint("[LOGIN] Soft reload NL storefront — header should expose Inloggen…")
+                page.goto(
+                    STOREFRONT_NL_URL,
+                    wait_until="domcontentloaded",
+                    timeout=55000,
+                )
+                _ensure_nl_storefront_dom_ready(page)
+                _dismiss_nl_storefront_privacy(page)
+                _ensure_nl_storefront_shell_ready(page)
+                _micro_pause_after_nl_shell_ready()
+            except Exception:
+                pass
+            if _logged_in_for_homepage_flow(page):
+                _lprint("[LOGIN] Session recognized after soft reload.")
+                return True
         clicked = _click_storefront_inloggen(page)
+        if clicked:
+            break
+
     # Primary login host is hosted WSP — not www .../account/login (often wrong/deprecated for this flow).
     fallback_url = "https://login.bol.com/wsp/login"
     use_fallback = os.getenv("BOL_BROWSER_LOGIN_INLOGGEN_FALLBACK_WSP", "1").strip().lower() not in (
@@ -2080,7 +2594,16 @@ def ensure_logged_in(
         _lprint("[LOGIN] Not logged in and BOL_EMAIL / BOL_PASSWORD missing.")
         return False
 
-    ok = browser_login(page, email=email, password=password, cmp_already_cleared=True)
+    try:
+        ok = browser_login(page, email=email, password=password, cmp_already_cleared=True)
+    except Exception as e:
+        if _playwright_target_closed(e):
+            _lprint(
+                "[LOGIN] Chromium lost the login tab mid-flow — outer run will retry "
+                "(homepage Inloggen retries reduce need for login.bol.com WSP).",
+            )
+            return False
+        raise
     if ok:
         _persist_storage_state(context, state_path, fp_bundle)
     return ok
@@ -2138,6 +2661,60 @@ def _settle_pdp_after_goto(page) -> None:
     if hi < lo:
         lo, hi = hi, lo
     time.sleep(random.uniform(lo, hi))
+
+
+def _pdp_requires_not_available_gate(product_url: str, _mod) -> bool:
+    """
+    Bol **product** PDPs (`/nl/nl/p/…`): check buy box for Not available before ATC logic.
+    Same monitor cadence as every other loaded PDP — ``BOL_BROWSER_POLL_OOS_MIN/MAX`` only; no per-SKU timing hacks.
+    """
+    u = (product_url or "").strip().replace("\\", "/").lower()
+    return "bol.com" in u and "/nl/nl/p/" in u
+
+
+def _apply_dom_listing_unavailable(page, out: dict) -> None:
+    """
+    Buy box shows **Not available** / **Niet leverbaar** instead of price + In winkelwagen (EN storefront + NL).
+    Scoped to ``main`` / ``article``. Runs on Bol product PDPs when ``_pdp_requires_not_available_gate`` is true.
+    """
+    out.setdefault("listing_unavailable", False)
+    heading_pat = re.compile(
+        r"^(Not\s+available|Niet\s+leverbaar|Momenteel\s+niet\s+leverbaar|Currently\s+unavailable|"
+        r"Tijdelijk\s+niet\s+leverbaar)$",
+        re.I,
+    )
+    roots: list = []
+    for sel in ('main', '[role="main"]', "article"):
+        try:
+            loc = page.locator(sel).first
+            if loc.count() > 0 and loc.is_visible(timeout=450):
+                roots.append(loc)
+                break
+        except Exception:
+            continue
+    root = roots[0] if roots else page
+
+    try:
+        h = root.get_by_role("heading", name=heading_pat)
+        if h.count() > 0 and h.first.is_visible(timeout=1400):
+            out["listing_unavailable"] = True
+            return
+    except Exception:
+        pass
+
+    for pat in (
+        re.compile(r"^\s*Not\s+available\s*$", re.I),
+        re.compile(r"^\s*Niet\s+leverbaar\s*$", re.I),
+        re.compile(r"^\s*Momenteel\s+niet\s+leverbaar\s*$", re.I),
+        re.compile(r"^\s*Currently\s+unavailable\s*$", re.I),
+    ):
+        try:
+            t = root.get_by_text(pat)
+            if t.count() > 0 and t.first.is_visible(timeout=1000):
+                out["listing_unavailable"] = True
+                return
+        except Exception:
+            continue
 
 
 def _apply_dom_buy_signals(page, out: dict) -> None:
@@ -2415,13 +2992,16 @@ def _evaluate_product_snapshot(
     mod,
     *,
     navigate: bool,
+    spacing_slot: int | None = None,
 ) -> dict:
     """
     PDP snapshot for **any** parallel Chromium slot (same logic for all).
     When navigate=False, reuse current DOM (fast poll) — caller must stay on URL.
     Avoid networkidle on PDP (was causing endless 'loading' feeling).
     Checkout only proceeds when **can_add** (visible add-to-cart control); no separate \"already in cart\" path.
+    ``spacing_slot``: bol_account / log slot id — enforces ``BOL_BROWSER_POLL_OOS_MIN`` between snapshots (monitor loop).
     """
+    _enforce_pdp_poll_min_gap(spacing_slot)
     pid = mod.extract_product_id(product_url) or ""
     out: dict = {
         "product_url": product_url,
@@ -2435,6 +3015,7 @@ def _evaluate_product_snapshot(
         "navigated": False,
         "has_op_voorraad": False,
         "product_title": None,
+        "listing_unavailable": False,
     }
 
     if navigate:
@@ -2448,6 +3029,7 @@ def _evaluate_product_snapshot(
         except Exception as e:
             out["offline"] = True
             out["load_error"] = str(e)[:240]
+            _mark_pdp_poll_spacing_end(spacing_slot)
             return out
         _dismiss_cookie_wall(page)
         _settle_pdp_after_goto(page)
@@ -2463,6 +3045,7 @@ def _evaluate_product_snapshot(
             except Exception as e:
                 out["offline"] = True
                 out["load_error"] = str(e)[:240]
+                _mark_pdp_poll_spacing_end(spacing_slot)
                 return out
             _dismiss_cookie_wall(page)
             _settle_pdp_after_goto(page)
@@ -2489,9 +3072,19 @@ def _evaluate_product_snapshot(
     out["offer_uid"] = mod._extract_offer_uid_from_pdp_html(html)
 
     lc = html.casefold()
+    gate_na = _pdp_requires_not_available_gate(product_url, mod)
+    if gate_na:
+        _apply_dom_listing_unavailable(page, out)
     _apply_dom_buy_signals(page, out)
+    if gate_na and out.get("can_add") and not out.get("listing_unavailable"):
+        _apply_dom_listing_unavailable(page, out)
+    if gate_na and out.get("listing_unavailable"):
+        out["can_add"] = False
+        out["has_op_voorraad"] = False
     has_pos = bool(out["can_add"] or out.get("has_op_voorraad"))
-    out["oos"] = _explicit_product_oos_from_html(lc, has_positive_buy_signal=has_pos)
+    out["oos"] = (gate_na and bool(out.get("listing_unavailable"))) or _explicit_product_oos_from_html(
+        lc, has_positive_buy_signal=has_pos
+    )
 
     out["price_text"] = _extract_price_text_from_pdp_html(html)
     if not out["price_text"]:
@@ -2521,6 +3114,15 @@ def _evaluate_product_snapshot(
         out["offline_reason"] = "bol_access_blocked"
         # Log line is neutral in _print_monitor_offline_log (URL may be pre-drop / not live yet).
 
+    # Gated PDP with visible Not available — stay on online monitor path (OOS poll delay, default ~6–9s), not 40s offline.
+    if (
+        _pdp_requires_not_available_gate(product_url, mod)
+        and out.get("listing_unavailable")
+        and out.get("offline_reason") != "bol_access_blocked"
+    ):
+        out["offline"] = False
+
+    _mark_pdp_poll_spacing_end(spacing_slot)
     return out
 
 
@@ -2538,8 +3140,9 @@ def _print_monitor_offline_log(
     url_part = f" URL: {short_u}" if short_u else ""
     if reason == "bol_access_blocked":
         print(
-            f"{sp}[MONITOR] OFFLINE — No full product page yet (not shoppable; may go live later). "
-            f"HTTP {http_s}.{url_part} Next check ~40–60s; staying on flow.",
+            f"{sp}[MONITOR] OFFLINE — Bol blocked this connection’s exit IP (IP-geblokkeerd). "
+            f"Still using **this account’s sticky proxy line** only — replace that line’s tunnel / IP or wait; "
+            f"product URL is unrelated. HTTP {http_s}.{url_part} Retry ~40–60s.",
             flush=True,
         )
         return
@@ -2551,7 +3154,9 @@ def _print_monitor_offline_log(
     )
 
 
-def _immediate_pdp_offline_probe(page, product_url: str, mod, sp: str) -> None:
+def _immediate_pdp_offline_probe(
+    page, product_url: str, mod, sp: str, *, use_proxy: bool
+) -> None:
     """
     After login, before post-login sleep: each Chromium worker calls this for **its own** CSV row
     (slot 0 → first URL, slot 1 → second, …) — not slot-1-only. Uses `_evaluate_product_snapshot`
@@ -2576,6 +3181,16 @@ def _immediate_pdp_offline_probe(page, product_url: str, mod, sp: str) -> None:
     if int(snap.get("http_status") or 0) == 0 and goto_status:
         snap["http_status"] = goto_status
     if snap.get("offline"):
+        if (
+            snap.get("offline_reason") == "bol_access_blocked"
+            and _failover_on_bol_access_blocked(use_proxy)
+        ):
+            print(
+                f"{sp}[FAILOVER] Bol IP-block page on first PDP — rotate tunnel; "
+                f"blocked proxy removed from reuse (this run + optional proxy.txt line drop).",
+                flush=True,
+            )
+            raise IpBlockFailoverRestart()
         _print_monitor_offline_log(sp, snap, url_hint=product_url)
 
 
@@ -2900,10 +3515,9 @@ def _checkout_labels_for_url(url: str) -> tuple[str, ...]:
             "Naar de kassa",
         )
     ul = (url or "").lower()
-    # Final summary blue CTA (see screenshot): \"Bestellen en betalen\" — exact phrase, not substring of Verder…
     _pay_confirm = (
-        "Bestellen en betalen",
         "iDEAL",
+        "Bestellen en betalen",
         "Betalen",
         "Betaal",
         "Bevestigen",
@@ -2915,7 +3529,6 @@ def _checkout_labels_for_url(url: str) -> tuple[str, ...]:
         "Ik ga bestellen",
         "Bestellen",
     )
-    # Near payment / ideal selection — same order; Bestellen en betalen first when visible (skips fast if absent).
     if "rnwy" in ul or "checkout" in ul:
         if any(x in ul for x in ("payment", "betaal", "betalen", "ideal", "afreken")):
             return _pay_confirm
@@ -2929,8 +3542,8 @@ def _checkout_labels_for_url(url: str) -> tuple[str, ...]:
         "Doorgaan",
         "Volgende",
         "Bevestigen",
-        "Bestellen en betalen",
         "iDEAL",
+        "Bestellen en betalen",
         "Betalen",
         "Betaal",
         "Bestellen",
@@ -2988,6 +3601,81 @@ def _checkout_log_land_after_login(page) -> None:
         f"[CHECKOUT]   title={ti!r}",
         flush=True,
     )
+
+
+def _checkout_try_select_ideal_payment_method(page) -> bool:
+    """
+    On the payment step: if iDEAL is not selected yet, select it; if it already is, do nothing.
+    Then the caller may click Bestellen en betalen / Betalen without confirming Afterpay etc.
+    """
+    if _extract_ideal_from_url(page.url or ""):
+        return True
+    if os.getenv("BOL_CHECKOUT_SKIP_IDEAL_ROW_CLICK", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    ):
+        return False
+    pat = re.compile(r"i\s*DEAL", re.I)
+    try:
+        group = page.get_by_role("radiogroup")
+        if group.count() > 0:
+            rad = group.get_by_role("radio", name=pat)
+            if rad.count() > 0:
+                el = rad.first
+                if el.is_visible(timeout=2000):
+                    try:
+                        if el.is_checked():
+                            return True
+                    except Exception:
+                        pass
+                    el.click(timeout=9000)
+                    time.sleep(random.uniform(0.12, 0.28))
+                    if _checkout_verbose_cta():
+                        _cprint("[CHECKOUT] Payment method: iDEAL (radiogroup radio).", flush=True)
+                    return True
+    except Exception:
+        pass
+    try:
+        rad = page.get_by_role("radio", name=pat)
+        if rad.count() > 0:
+            el = rad.first
+            if el.is_visible(timeout=2000):
+                try:
+                    if el.is_checked():
+                        return True
+                except Exception:
+                    pass
+                el.click(timeout=9000)
+                time.sleep(random.uniform(0.12, 0.28))
+                if _checkout_verbose_cta():
+                    _cprint("[CHECKOUT] Payment method: iDEAL (radio).", flush=True)
+                return True
+    except Exception:
+        pass
+    try:
+        lab = page.locator("label:visible").filter(has_text=pat).first
+        if lab.is_visible(timeout=1600):
+            try:
+                fid_clean = (lab.get_attribute("for") or "").strip()
+                if fid_clean and '"' not in fid_clean and "'" not in fid_clean:
+                    inp = page.locator(f'[id="{fid_clean}"]')
+                    if inp.count() > 0 and inp.first.is_visible(timeout=800):
+                        try:
+                            if inp.first.is_checked():
+                                return True
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+            lab.click(timeout=9000)
+            time.sleep(random.uniform(0.12, 0.28))
+            if _checkout_verbose_cta():
+                _cprint("[CHECKOUT] Payment method: iDEAL (label).", flush=True)
+            return True
+    except Exception:
+        pass
+    return False
 
 
 def _checkout_click_dutch_cta(page, label: str, *, verbose: bool | None = None) -> bool:
@@ -3513,6 +4201,9 @@ def _checkout_flow_browser(
 
         labels_next = _checkout_labels_for_url(cur)
 
+        if _checkout_url_looks_like_runway(cur):
+            _checkout_try_select_ideal_payment_method(page)
+
         _dismiss_cookie_wall(page)
         clicked = False
         for lab in labels_next:
@@ -3610,6 +4301,8 @@ def _slot_inner_iteration(
     discord_thread_name,
     reload_every: int,
     reload_sec: float,
+    log_sid: int,
+    use_proxy: bool,
 ) -> tuple[bool, int, float | None, bool]:
     """
     Single iteration of the monitor inner loop for one context.
@@ -3617,8 +4310,8 @@ def _slot_inner_iteration(
     Fourth is True after offline-wait, after checkout completes, or while continuing online monitor;
     False when re-login failed (session lost).
     """
-    sp = f"[S{slot + 1}] "
-    _set_checkout_log_slot(slot + 1)
+    sp = f"[S{log_sid}] "
+    _set_checkout_log_slot(log_sid)
     pid = mod.extract_product_id(url) or ""
 
     if "account/login" in (page.url or "").lower():
@@ -3630,20 +4323,39 @@ def _slot_inner_iteration(
             return False, poll_idx, None, False
 
     full_reload = poll_idx % reload_every == 0
-    snap = _evaluate_product_snapshot(page, url, mod, navigate=full_reload)
+    snap = _evaluate_product_snapshot(
+        page, url, mod, navigate=full_reload, spacing_slot=log_sid
+    )
     poll_idx += 1
 
     if snap.get("offline"):
+        if (
+            snap.get("offline_reason") == "bol_access_blocked"
+            and _failover_on_bol_access_blocked(use_proxy)
+        ):
+            print(
+                f"{sp}[FAILOVER] Bol IP-block (IP-geblokkeerd) — immediate rotate; "
+                f"this tunnel is blacklisted (not treated like generic offline / sorry-page). "
+                f"Use spare proxy rows or BOL_BROWSER_ALLOW_PROXY_FAILOVER_OTHER_LINES=1.",
+                flush=True,
+            )
+            raise IpBlockFailoverRestart()
         _print_monitor_offline_log(sp, snap, url_hint=url)
         poll_idx = 0
         return True, poll_idx, time.time() + _pause_offline_duration(), True
 
     if snap["oos"]:
+        _un = snap.get("listing_unavailable")
+        _why = (
+            " — PDP shows Not available / Niet leverbaar (monitor only, no ATC)"
+            if _un
+            else " (niet op voorraad / levering)"
+        )
         print(
-            f"{sp}[MONITOR] confirmed OOS (niet op voorraad), skip cart: {url[:72]}…",
+            f"{sp}[MONITOR] confirmed OOS{_why}, skip cart: {url[:72]}…",
             flush=True,
         )
-        return True, poll_idx, time.time() + _pause_online_duration(), False
+        return True, poll_idx, time.time() + _pause_oos_monitor_duration(), False
 
     if not snap["can_add"]:
         mode = "full PDP reload" if snap.get("navigated") else "light DOM poll"
@@ -3658,7 +4370,7 @@ def _slot_inner_iteration(
             f"{sp}[MONITOR] online — {mode}; {poll_hint} {url[:56]}…",
             flush=True,
         )
-        return True, poll_idx, time.time() + _pause_online_duration(), False
+        return True, poll_idx, time.time() + _pause_oos_monitor_duration(), False
 
     try:
         cur_u = (page.url or "").strip()
@@ -3671,7 +4383,7 @@ def _slot_inner_iteration(
     )
 
     if not _click_add_to_cart(page, sp=sp):
-        return True, reload_every - 1, time.time() + _pause_online_duration(), False
+        return True, reload_every - 1, time.time() + _pause_oos_monitor_duration(), False
 
     idle_atc = float(os.getenv("BOL_CHECKOUT_AFTER_ATC_IDLE_SEC", "1.0"))
     print(
@@ -3682,7 +4394,7 @@ def _slot_inner_iteration(
     if not _ensure_atc_confirmed_before_checkout(
         page, sp=sp, product_url=url, mod=mod, idle_sec=idle_atc
     ):
-        return True, reload_every - 1, time.time() + _pause_online_duration(), False
+        return True, reload_every - 1, time.time() + _pause_oos_monitor_duration(), False
 
     try:
         try:
@@ -3778,11 +4490,15 @@ def _browser_slot_worker(
     slot: int,
     mod,
     use_proxy: bool,
+    proxy_file: Path,
     proxy_rows: list,
     session_paths: list[Path],
     fp_bundles: list,
     slot_http_urls: list[str],
+    slot_url_pick_index: int,
+    binding_account_num: int,
     sticky_slot_product_url: bool,
+    allow_proxy_failover_other_lines: bool,
     email: str,
     password: str,
     discord_webhook,
@@ -3794,13 +4510,12 @@ def _browser_slot_worker(
     channel: str | None,
     shutdown_ev: threading.Event,
     login_outcomes: list[bool | None],
-    failover_pool_lines: list[tuple[str, str, str, str]],
     enabled_slot_indices_sorted: tuple[int, ...],
 ) -> None:
     """One Playwright sync loop per thread — same PDP monitor → checkout flow for every slot."""
     from playwright.sync_api import sync_playwright
 
-    sid = slot + 1
+    sid = binding_account_num
     sp = f"[S{sid}] "
     _set_checkout_log_slot(sid)
     # Tile windows by **enabled browser order** (first opened = top-left), not by absolute S2/S3 index —
@@ -3828,13 +4543,24 @@ def _browser_slot_worker(
             f"{sp}[BIND] Internal error: storage path {state_path.name!r} ≠ expected {expected_session_name!r}.",
             flush=True,
         )
-    proxy_ln = f"proxy.txt line {sid}" if use_proxy else "direct (USE_PROXIES=0)"
+    proxy_ln = _proxy_primary_label(sid, use_proxy)
     print(
         f"{sp}[BIND] Chromium S{sid} ⟷ `{state_path.name}` ⟷ `{fp_txt.name}` ⟷ {proxy_ln} "
         f"⟷ login {_mask_login_hint(email)} "
         f"(window #{pos_idx + 1}/{n_enabled_windows})",
         flush=True,
     )
+    if use_proxy and proxy_rows and binding_account_num >= 1:
+        try:
+            ph, ppt, pu, ppw = proxy_rows[binding_account_num - 1]
+            if _proxy_tuple_fingerprint(ph, ppt, pu, ppw) != fp_bundles[slot][1]:
+                print(
+                    f"{sp}[BIND] Bugcheck: cookie fingerprint bundle ≠ primary proxy row "
+                    f"{binding_account_num} — report this.",
+                    flush=True,
+                )
+        except (IndexError, TypeError):
+            pass
 
     # Default 0 so parallel Chromiums start together; stagger made slot 2 look \"stuck\" on CMP while S1 advanced.
     _st_ms = max(0, int(os.getenv("BOL_BROWSER_SLOT_LAUNCH_STAGGER_MS", "0")))
@@ -3845,10 +4571,16 @@ def _browser_slot_worker(
         os.getenv("BOL_BROWSER_FAILOVER_ENABLED", "1").strip().lower()
         not in ("0", "false", "no", "off")
     )
-    primary_proxy = proxy_rows[slot] if use_proxy else ("", "", "", "")
+    primary_proxy = (
+        proxy_rows[binding_account_num - 1] if use_proxy else ("", "", "", "")
+    )
     chain: list[tuple[str, str, str, str]] = []
     if use_proxy:
-        chain = _unique_proxy_chain(primary_proxy, failover_pool_lines)
+        chain = _proxy_failover_chain_for_bol_account(
+            binding_account_num,
+            proxy_rows,
+            allow_other_lines=allow_proxy_failover_other_lines,
+        )
     proxy_cursor = 0
     consecutive_auth_resets = 0
     login_failover_ev = threading.Event()
@@ -3861,6 +4593,7 @@ def _browser_slot_worker(
             login_failover_ev.clear()
 
             current_proxy_row: tuple[str, str, str, str] | None = None
+            launch_proxy: dict[str, str] | None = None
             ctx_kw: dict = {
                 "viewport": {"width": 1360, "height": 880},
                 "locale": "nl-NL",
@@ -3883,14 +4616,39 @@ def _browser_slot_worker(
                     continue
                 active_pidx, (h, pt, u, pw) = picked
                 current_proxy_row = (h, pt, u, pw)
-                ctx_kw["proxy"] = {
+                prox = {
                     "server": f"http://{h}:{pt}",
                     "username": u,
                     "password": pw,
                 }
+                # Context-level proxy auth often yields HTTP 407 on HTTPS CONNECT; launch-level is reliable.
+                if os.getenv("BOL_BROWSER_PROXY_ON_CONTEXT", "").strip().lower() in (
+                    "1",
+                    "true",
+                    "yes",
+                    "on",
+                ):
+                    ctx_kw["proxy"] = prox
+                else:
+                    launch_proxy = prox
                 fp_hex = _proxy_tuple_fingerprint(h, pt, u, pw)
                 hint = _proxy_hint_log(h, pt, u)
                 fb_box[0] = (fp_txt, fp_hex, hint)
+                prim_tup = tuple(primary_proxy)
+                cur_tup = (h, pt, u, pw)
+                _prim_lbl = _proxy_primary_label(binding_account_num, use_proxy)
+                if cur_tup == prim_tup:
+                    print(
+                        f"{sp}[BIND] Playwright proxy **is** primary **`{_prim_lbl}`** "
+                        f"({hint}) — matches bol_account={binding_account_num}. "
+                        "Same host:port on every line is normal; **session-… inside username** must differ per line.",
+                        flush=True,
+                    )
+                else:
+                    print(
+                        f"{sp}[BIND] Playwright proxy **not** primary (`{_prim_lbl}`; failover / cooling) — using {hint}",
+                        flush=True,
+                    )
             else:
                 fp_hex = _FP_DIRECT
                 hint = "direct (USE_PROXIES=0)"
@@ -3926,18 +4684,24 @@ def _browser_slot_worker(
                 )
 
             with sync_playwright() as p:
-                browser = p.chromium.launch(
-                    headless=False,
-                    channel=channel,
-                    slow_mo=slow_mo_ms,
-                    args=[
+                _launch_kw: dict = {
+                    "headless": False,
+                    "slow_mo": slow_mo_ms,
+                    "args": [
                         "--disable-blink-features=AutomationControlled",
                         f"--window-position={wx},{wy}",
                     ],
-                )
+                }
+                if channel:
+                    _launch_kw["channel"] = channel
+                if launch_proxy:
+                    _launch_kw["proxy"] = launch_proxy
+                browser = p.chromium.launch(**_launch_kw)
                 print(f"{sp}[BROWSER] Chromium opened (parallel slot thread).", flush=True)
-                ctx = browser.new_context(**ctx_kw)
-                page = ctx.new_page()
+                _io = _session_state_io_lock(state_path)
+                with _io:
+                    ctx = browser.new_context(**ctx_kw)
+                    page = ctx.new_page()
 
                 if not session_paths[slot].is_file():
                     print(
@@ -3947,6 +4711,7 @@ def _browser_slot_worker(
                     )
 
                 persist_ok = True
+                last_binding_url = (slot_http_urls[slot] or "").strip()
                 try:
                     try:
                         logged = ensure_logged_in(
@@ -3963,7 +4728,7 @@ def _browser_slot_worker(
                         logged = False
 
                     if not logged:
-                        proxy_ln = f"proxy.txt line {sid}" if use_proxy else "direct (USE_PROXIES=0)"
+                        proxy_ln = _proxy_primary_label(sid, use_proxy)
                         print(
                             f"{sp}[BROWSER] NL homepage / login failed ({proxy_ln}). "
                             "Other slots continue if healthy.",
@@ -3989,26 +4754,45 @@ def _browser_slot_worker(
                     ord_probe, probe_load_err = _load_ordered_http_products_retry(
                         mod, phase="post-login PDP probe"
                     )
-                    probe_u = _pick_slot_product_url(
-                        slot, ord_probe, slot_http_urls, sticky=sticky_slot_product_url
+                    probe_u = _pick_product_url_for_bol_account(
+                        binding_account_num,
+                        ord_probe,
+                        slot=slot,
+                        slot_http_urls=slot_http_urls,
+                        sticky=sticky_slot_product_url,
+                        url_pick_index=slot_url_pick_index,
                     )
                     # One PDP load here — monitor starts with poll_idx=1 so first poll does not full-reload again.
                     if probe_u:
-                        if probe_load_err or (
-                            not sticky_slot_product_url and slot >= len(ord_probe)
-                        ):
-                            _note = probe_load_err or "fewer http rows than slots"
+                        if probe_load_err:
                             print(
-                                f"{sp}[MONITOR] PDP probe — slot-bound URL; CSV note: {_note}",
+                                f"{sp}[MONITOR] PDP probe — using resolved URL; CSV load note: {probe_load_err}",
                                 flush=True,
                             )
-                        _immediate_pdp_offline_probe(page, probe_u, mod, sp)
+                        _immediate_pdp_offline_probe(
+                            page, probe_u, mod, sp, use_proxy=use_proxy
+                        )
+                        last_binding_url = (probe_u or "").strip()
+                        try:
+                            _persist_storage_state(
+                                ctx,
+                                session_paths[slot],
+                                fb_box[0],
+                                binding_url=last_binding_url,
+                                binding_account=binding_account_num,
+                                binding_credential_fp=_credential_fingerprint(
+                                    email, password
+                                ),
+                            )
+                        except Exception:
+                            pass
                     else:
                         _reset_to_nl_storefront(page, sp=sp)
                         print(
-                            f"{sp}[MONITOR] No product URL for this slot — CSV has only "
-                            f"{len(ord_probe)} http URL(s); add row {sid} in {mod.PRODUCTS_FILE} "
-                            f"or disable tab {sid}. Browser stays on storefront until fixed.",
+                            f"{sp}[MONITOR] No product URL for worker W{slot + 1} (bol_account={binding_account_num}) — "
+                            f"CSV has only {len(ord_probe)} http URL(s); add a row with an https link in "
+                            f"{mod.PRODUCTS_FILE} or disable worker W{slot + 1} in slot flags. "
+                            "Browser stays on storefront until fixed.",
                             flush=True,
                         )
 
@@ -4023,15 +4807,20 @@ def _browser_slot_worker(
                     warned_csv_fallback = False
                     while not shutdown_ev.is_set():
                         reload_every = max(
-                            2,
-                            int(os.getenv("BOL_BROWSER_FULL_RELOAD_EVERY_N_POLLS", "8")),
+                            1,
+                            int(os.getenv("BOL_BROWSER_FULL_RELOAD_EVERY_N_POLLS", "3")),
                         )
                         products, err = mod.try_load_products_runtime(mod.PRODUCTS_FILE)
                         ordered = (
                             _ordered_http_products(products) if (not err and products) else []
                         )
-                        url = _pick_slot_product_url(
-                            slot, ordered, slot_http_urls, sticky=sticky_slot_product_url
+                        url = _pick_product_url_for_bol_account(
+                            binding_account_num,
+                            ordered,
+                            slot=slot,
+                            slot_http_urls=slot_http_urls,
+                            sticky=sticky_slot_product_url,
+                            url_pick_index=slot_url_pick_index,
                         )
 
                         if err and not url:
@@ -4084,6 +4873,8 @@ def _browser_slot_worker(
                                     discord_thread_name=discord_thread_name,
                                     reload_every=reload_every,
                                     reload_sec=reload_sec,
+                                    log_sid=binding_account_num,
+                                    use_proxy=use_proxy,
                                 )
                                 if shutdown_ev.is_set():
                                     break
@@ -4104,9 +4895,9 @@ def _browser_slot_worker(
                         if not url:
                             if not warned_short_products:
                                 print(
-                                    f"{sp}[MONITOR] Waiting — no product URL at CSV index {sid} "
-                                    f"(have {len(ordered)} URL(s)). Add row {sid} or disable this slot; "
-                                    f"retry every {reload_sec:.0f}s.",
+                                    f"{sp}[MONITOR] Waiting — worker W{slot + 1} (bol_account={binding_account_num}) "
+                                    f"has no URL yet (CSV shows {len(ordered)} http row(s)). "
+                                    f"Save a product URL for this worker or disable it; retry every {reload_sec:.0f}s.",
                                     flush=True,
                                 )
                                 warned_short_products = True
@@ -4119,23 +4910,31 @@ def _browser_slot_worker(
                                 break
                             continue
 
+                        last_binding_url = (url or "").strip()
                         run_slot_product_url(url)
                         if login_failover_ev.is_set() and failover_enabled:
                             raise FailoverIdentityRestart()
 
                         if shutdown_ev.wait(reload_sec):
                             break
-                except FailoverIdentityRestart:
+                except FailoverIdentityRestart as e:
                     persist_ok = False
                     if (
                         use_proxy
                         and failover_enabled
                         and current_proxy_row is not None
                     ):
-                        ProxyCooldownRegistry.mark(
-                            *current_proxy_row,
-                            _failover_proxy_cooldown_sec(),
-                        )
+                        if isinstance(e, IpBlockFailoverRestart):
+                            ProxyCooldownRegistry.ban_permanent(*current_proxy_row)
+                            if _env_remove_ip_blocked_line_from_proxy_txt():
+                                _remove_proxy_txt_line_matching_row(
+                                    proxy_file, current_proxy_row, sp
+                                )
+                        else:
+                            ProxyCooldownRegistry.mark(
+                                *current_proxy_row,
+                                _failover_proxy_cooldown_sec(),
+                            )
                         proxy_cursor = (active_pidx + 1) % max(len(chain), 1)
                         consecutive_auth_resets += 1
                     login_failover_ev.clear()
@@ -4143,7 +4942,13 @@ def _browser_slot_worker(
                     try:
                         if login_outcomes[slot] is True and persist_ok:
                             _persist_storage_state(
-                                ctx, session_paths[slot], fb_box[0]
+                                ctx,
+                                session_paths[slot],
+                                fb_box[0],
+                                binding_url=last_binding_url
+                                or (slot_http_urls[slot] or "").strip(),
+                                binding_account=binding_account_num,
+                                binding_credential_fp=_credential_fingerprint(email, password),
                             )
                     except Exception:
                         pass
@@ -4186,23 +4991,32 @@ def run_browser_mode_entry() -> None:
 
     proxy_file = Path(cwd) / mod.PROXY_FILE
     use_proxy = truthy("USE_PROXIES", "1")
-    proxy_rows = _parse_all_proxy_lines(proxy_file) if use_proxy else []
-
-    pool_file_name = (
-        os.getenv("BOL_BROWSER_FAILOVER_POOL_FILE") or DEFAULT_FAILOVER_POOL_FILE
-    ).strip()
-    failover_pool_path = Path(cwd) / pool_file_name
-    _ensure_failover_pool_file(failover_pool_path)
-    failover_pool_lines = (
-        _parse_all_proxy_lines(failover_pool_path) if use_proxy else []
-    )
+    proxy_rows = _effective_browser_proxy_rows(proxy_file, use_proxy=use_proxy)
 
     if use_proxy and not proxy_rows:
         print(
-            "[BROWSER] USE_PROXIES=1 but proxy.txt has no valid host:port:user:pass line.",
+            f"[BROWSER] USE_PROXIES=1 but no proxies: add valid host:port:user:pass lines to {mod.PROXY_FILE}.",
             flush=True,
         )
         sys.exit(1)
+
+    if use_proxy and len(proxy_rows) >= 2:
+        _fps_seen: dict[str, int] = {}
+        for _li, _tup in enumerate(proxy_rows):
+            _fp = _proxy_tuple_fingerprint(*_tup)
+            if _fp in _fps_seen:
+                print(
+                    f"[SETUP] WARNING: effective proxy rows {_fps_seen[_fp] + 1} and {_li + 1} are **identical** "
+                    f"(host:port:user:pass). Sessions still split by **bol_account** — "
+                    "but Playwright tunnels match; fix duplicates so account 3 ≠ account 1 tunnel.",
+                    flush=True,
+                )
+                break
+            _fps_seen[_fp] = _li
+
+    allow_proxy_failover_other_lines = truthy(
+        "BOL_BROWSER_ALLOW_PROXY_FAILOVER_OTHER_LINES", "0"
+    )
 
     if not ordered_preview:
         print(
@@ -4211,90 +5025,143 @@ def run_browser_mode_entry() -> None:
         )
         sys.exit(1)
 
-    if use_proxy:
-        n_resource = min(len(ordered_preview), len(proxy_rows), base_parallel_cap)
-    else:
-        # Same parallelism rule as proxy mode (minus proxy rows): each slot runs the identical
-        # worker — login → PDP probe → monitor → ATC → checkout. Old min(1,…) forced only S1.
-        n_resource = min(len(ordered_preview), base_parallel_cap)
+    # Parallelism = product rows (URLs), capped by BOL_BROWSER_MAX_PARALLEL — **not** by proxy count.
+    # Each row's bol_account N uses proxy.txt line N and session_N.json (identity binding).
+    n_resource = min(len(ordered_preview), base_parallel_cap)
 
     repeat_last = truthy("BOL_BROWSER_REPEAT_LAST_URL_FOR_SLOTS", "0")
     if repeat_last:
-        if use_proxy:
-            slot_budget = min(len(proxy_rows), base_parallel_cap)
-        else:
-            slot_budget = base_parallel_cap
+        slot_budget = base_parallel_cap
         if slot_budget > n_resource:
             print(
-                "[SETUP] BOL_BROWSER_REPEAT_LAST_URL_FOR_SLOTS=1 — extra Chromium slot(s) use the "
-                "last http URL from CSV with their proxy line (same PDP, different identity).",
+                "[SETUP] BOL_BROWSER_REPEAT_LAST_URL_FOR_SLOTS=1 — extra Chromium slot(s) reuse the "
+                "last CSV URL + bol_account (same PDP; proxy/session follow that bol_account).",
                 flush=True,
             )
             n_resource = slot_budget
 
     slot_http_urls: list[str] = []
+    credential_accounts: list[int] = []
+    worker_csv_rows: list[int] = []
     for _i in range(n_resource):
         _j = min(_i, len(ordered_preview) - 1)
         slot_http_urls.append((ordered_preview[_j][1] or "").strip())
+        credential_accounts.append(
+            _product_bol_account_number(ordered_preview[_j][0], _j)
+        )
+        worker_csv_rows.append(_j)
+
+    if not truthy("BOL_BROWSER_WORKERS_CSV_ROW_ORDER", "0"):
+        _pack = list(zip(credential_accounts, slot_http_urls, worker_csv_rows))
+        _pack.sort(key=lambda t: (t[0], t[2]))
+        credential_accounts = [t[0] for t in _pack]
+        slot_http_urls = [t[1] for t in _pack]
+        worker_csv_rows = [t[2] for t in _pack]
+
+    slot_url_pick_indices: list[int] = []
+    for _wi in range(len(credential_accounts)):
+        _wa = credential_accounts[_wi]
+        slot_url_pick_indices.append(
+            sum(1 for _wj in range(_wi) if credential_accounts[_wj] == _wa)
+        )
+
+    if use_proxy:
+        max_acc = max(
+            _product_bol_account_number(pd, ri)
+            for ri, (pd, _) in enumerate(ordered_preview)
+        )
+        if max_acc > len(proxy_rows):
+            print(
+                f"[BROWSER] product.csv needs bol_account ≤ {len(proxy_rows)} (proxy.txt lines) "
+                f"but some row uses bol_account={max_acc}. Add a line to {mod.PROXY_FILE} or lower the account pick.",
+                flush=True,
+            )
+            sys.exit(1)
 
     if n_resource < 1:
         print("[BROWSER] No monitor slots — check products and BOL_BROWSER_MAX_PARALLEL.", flush=True)
         sys.exit(1)
 
     if truthy("BOL_BROWSER_USE_SLOT_ENABLE_FLAGS", "0"):
-        requested_slots: list[int] = []
+        # SLOT_n means **bol_account N** (session_N / proxy N), not “Nth CSV row” or “Nth worker index”.
+        want_accounts: set[int] = set()
         if truthy("BOL_BROWSER_ENABLE_SLOT_1", "1"):
-            requested_slots.append(0)
+            want_accounts.add(1)
         if truthy("BOL_BROWSER_ENABLE_SLOT_2", "1"):
-            requested_slots.append(1)
+            want_accounts.add(2)
         if truthy("BOL_BROWSER_ENABLE_SLOT_3", "1"):
-            requested_slots.append(2)
-        enabled_slot_indices = [s for s in requested_slots if s < n_resource]
+            want_accounts.add(3)
+        enabled_slot_indices = [
+            wi for wi in range(n_resource) if credential_accounts[wi] in want_accounts
+        ]
+        enabled_slot_indices.sort(key=lambda wi: credential_accounts[wi])
         if not enabled_slot_indices:
             print(
                 "[BROWSER] No Chromium slots — BOL_BROWSER_USE_SLOT_ENABLE_FLAGS=1 but every "
-                "BOL_BROWSER_ENABLE_SLOT_n is off or none fit CSV/proxy rows.",
+                "BOL_BROWSER_ENABLE_SLOT_n is off, or no worker uses those bol_accounts in this run.",
                 flush=True,
             )
             sys.exit(1)
-        skipped_wr = [s + 1 for s in requested_slots if s >= n_resource]
-        if skipped_wr:
+        running_accounts = {credential_accounts[wi] for wi in range(n_resource)}
+        missing_slots = sorted(want_accounts - running_accounts)
+        if missing_slots:
             print(
-                f"[SETUP] Slot(s) {[f'S{x}' for x in skipped_wr]} flagged but "
-                f"need CSV row + proxy line {max(skipped_wr)} — not started.",
+                f"[SETUP] BOL_BROWSER_ENABLE_SLOT_n on for bol_account(s) {missing_slots} but this run has no worker "
+                f"for them (not among the first {n_resource} CSV row worker(s) / parallel cap). Raise cap or add rows.",
                 flush=True,
             )
     else:
         enabled_slot_indices = list(range(n_resource))
 
-    if use_proxy:
-        # Reminder at startup: failover is separate from proxy.txt primary lines (optional pool).
-        if failover_pool_lines:
+    if n_resource == 1:
+        _a = credential_accounts[0]
+        print(
+            f"[BROWSER] Single tab: **only bol_account={_a}** — one Chromium window uses "
+            f"session_{_a}.json + {_proxy_primary_label(_a, use_proxy)} + Email{_a}/Password{_a}. "
+            "Another row/account = another window only when you raise parallel cap / add rows.",
+            flush=True,
+        )
+    else:
+        print(
+            f"[BROWSER] Parallel: **{n_resource} separate Chromium processes** — each window is locked to one "
+            f"bol_account (session_N + proxy N + EmailN); PDP URLs come from CSV rows that pick that account.",
+            flush=True,
+        )
+        if not truthy("BOL_BROWSER_WORKERS_CSV_ROW_ORDER", "0"):
             print(
-                f"[SETUP] Failover pool `{failover_pool_path.name}`: "
-                f"{len(failover_pool_lines)} extra line(s) — used only when login/session breaks "
-                f"(not for normal offline PDP). Cooldown: BOL_BROWSER_PROXY_FAIL_COOLDOWN_SEC "
-                f"(default 900); relogin delay: BOL_BROWSER_FAILOVER_RELOGIN_MIN_SEC/"
-                f"MAX_SEC (default 10–30).",
+                "[SETUP] Worker windows ordered by **bol_account** (lowest account = first tile). "
+                "CSV row order does not move account 3 into the first window. "
+                "Legacy: BOL_BROWSER_WORKERS_CSV_ROW_ORDER=1.",
                 flush=True,
             )
+
+    if use_proxy:
+        if allow_proxy_failover_other_lines:
+            print(
+                "[SETUP] Proxy failover ON (`BOL_BROWSER_ALLOW_PROXY_FAILOVER_OTHER_LINES=1`): bol_account N uses "
+                f"line N first, then other rows in `{mod.PROXY_FILE}` (cooling skips).",
+                flush=True,
+            )
+            _used_lines = {credential_accounts[i] for i in range(n_resource)}
+            _spare = len(proxy_rows) - len(_used_lines)
+            if _spare > 0:
+                print(
+                    f"[SETUP] {_spare} proxy line(s) not primary for this run — eligible for failover rotation.",
+                    flush=True,
+                )
         else:
             print(
-                f"[SETUP] `{failover_pool_path.name}` — no optional backup lines (normal). "
-                f"Slots use `{mod.PROXY_FILE}`; add spare host:port:user:pass rows here only if you want "
-                f"extra identities after login/session recovery.",
+                "[SETUP] Sticky proxy per account (default): bol_account N uses **only** "
+                f"`{mod.PROXY_FILE}` line N — no automatic hop to other lines; "
+                "CSV product URL does not change that. Failover pool: set "
+                "BOL_BROWSER_ALLOW_PROXY_FAILOVER_OTHER_LINES=1.",
                 flush=True,
             )
 
     if not repeat_last and len(ordered_preview) > n_resource:
         print(
-            f"[SETUP] {len(ordered_preview) - n_resource} product URL(s) exceed proxy lines / parallel cap "
-            f"— only the first {n_resource} URL(s) are monitored (CSV order ↔ proxy line index).",
-            flush=True,
-        )
-    if use_proxy and len(proxy_rows) > n_resource:
-        print(
-            f"[SETUP] {len(proxy_rows) - n_resource} proxy line(s) unused (fewer products or cap).",
+            f"[SETUP] {len(ordered_preview) - n_resource} product URL(s) exceed parallel cap ({base_parallel_cap}) "
+            f"— only the first {n_resource} CSV row(s) start.",
             flush=True,
         )
     if not use_proxy and len(ordered_preview) > 1:
@@ -4308,18 +5175,27 @@ def run_browser_mode_entry() -> None:
     cookies_dir.mkdir(parents=True, exist_ok=True)
 
     print("[SETUP] ========== Session / proxy alignment (before browser) ==========", flush=True)
-    start_labels = ", ".join(f"S{s + 1}" for s in enabled_slot_indices)
+    start_labels = ", ".join(f"S{credential_accounts[s]}" for s in enabled_slot_indices)
+    worker_bind = " · ".join(
+        f"W{i + 1}=account{credential_accounts[i]}→session_{credential_accounts[i]}.json+"
+        f"{_proxy_slot_short_label(credential_accounts[i], use_proxy)}"
+        for i in range(n_resource)
+    )
     print(
-        "[SETUP] One Chromium per slot index (same worker code; separate threads). "
+        f"[SETUP] Each worker has its **own** Chromium context + cookies file + proxy line (no sharing): {worker_bind}",
+        flush=True,
+    )
+    print(
+        "[SETUP] One Chromium per CSV row (worker order W1,W2…; same code). "
         f"Starting: {start_labels} — {len(enabled_slot_indices)} window(s); "
-        f"{n_resource} URL/proxy row(s) (cap {base_parallel_cap}). "
-        "Bind: CSV row N ↔ proxy line N ↔ session_N.json ↔ EmailN/PasswordN.",
+        f"{n_resource} row(s) (cap {base_parallel_cap}). "
+        "Bind: **bol_account N** from that row → proxy.txt **line N** + "
+        "**session_N.json** + **EmailN/PasswordN** (fingerprint = that tunnel).",
         flush=True,
     )
     if len(enabled_slot_indices) > 1:
         print(
-            "[SETUP] Parallel slots — each Chromium uses its own Bol account "
-            "(Email1/Password1 … Email3/Password3 in .env).",
+            "[SETUP] Parallel slots — each row can pick which Bol account to use (bol_account column; .env Email1…3).",
             flush=True,
         )
     if sticky_slot_product_url:
@@ -4330,21 +5206,50 @@ def run_browser_mode_entry() -> None:
             flush=True,
         )
 
+    _acc_enabled = [credential_accounts[s] for s in enabled_slot_indices]
+    if len(enabled_slot_indices) > 1 and len(set(_acc_enabled)) < len(_acc_enabled):
+        print(
+            "[SETUP] Multiple workers share the same bol_account (same session_N.json on disk). "
+            "Saves are locked + atomic so cookies do not corrupt; for clean parallel identities use one bol_account "
+            "per worker row.",
+            flush=True,
+        )
+
     session_paths: list[Path] = []
     fp_bundles: list[tuple[Path, str, str]] = []
 
+    # Every configured proxy row N can have session_N.json on disk — wipe if proxy.txt
+    # changed even when this run does not start a worker for bol_account N (e.g. parallel cap 1).
+    if use_proxy:
+        for acc in range(1, len(proxy_rows) + 1):
+            _sp = cookies_dir / f"session_{acc}.json"
+            _ft = _session_fingerprint_txt_path(cookies_dir, acc)
+            _lf = _session_fingerprint_legacy_fp_path(cookies_dir, acc)
+            _h, _pt, _u, _pw = proxy_rows[acc - 1]
+            _cfp = _proxy_tuple_fingerprint(_h, _pt, _u, _pw)
+            _hd = _proxy_hint_log(_h, _pt, _u)
+            _sync_session_file_with_proxy_fingerprint(
+                _sp,
+                _ft,
+                _lf,
+                _cfp,
+                session_id=acc,
+                hint=_hd,
+                announce=True,
+                announce_actions_only=True,
+            )
+
     for slot in range(n_resource):
-        sid = slot + 1
-        em_slot, pw_slot = _bol_credentials_for_slot(slot)
+        acc_n = credential_accounts[slot]
+        sid = acc_n
+        em_slot, pw_slot = _bol_credentials_for_account_number(acc_n)
         if slot in enabled_slot_indices:
             if not em_slot.strip() or not pw_slot.strip():
-                if slot == 0:
-                    need = "Email1/Password1 or legacy Email/Password (and matching password keys)"
-                else:
-                    need = f"Email{sid}/Password{sid} (or BOL_EMAIL{sid}/BOL_PASSWORD{sid})"
+                need = (
+                    f"Email{acc_n}/Password{acc_n} (or BOL_EMAIL{acc_n}/BOL_PASSWORD{acc_n})"
+                )
                 print(
-                    f"[SETUP] Slot {sid} has empty credentials — set {need} in .env. "
-                    "Each parallel slot must use its own Bol account so sessions do not overlap.",
+                    f"[SETUP] Worker W{slot + 1} (bol_account={acc_n}) has empty credentials — set {need} in .env.",
                     flush=True,
                 )
                 sys.exit(1)
@@ -4355,7 +5260,7 @@ def run_browser_mode_entry() -> None:
         session_paths.append(state_path)
 
         if use_proxy:
-            host, port, user, pw = proxy_rows[slot]
+            host, port, user, pw = proxy_rows[acc_n - 1]
             current_fp = _proxy_tuple_fingerprint(host, port, user, pw)
             proxy_desc = _proxy_hint_log(host, port, user)
         else:
@@ -4365,37 +5270,60 @@ def run_browser_mode_entry() -> None:
         fp_bundles.append((fp_txt, current_fp, proxy_desc))
 
         if slot in enabled_slot_indices:
-            print(f"[SETUP] Slot {sid}: {state_path.name} + {fp_txt.name}", flush=True)
-            print(f"[SETUP] Slot {sid} login user (masked): {_mask_login_hint(em_slot)}", flush=True)
+            print(
+                f"[SETUP] W{slot + 1} bol_account={acc_n}: {state_path.name} + {fp_txt.name} + "
+                f"{_session_binding_json_path(cookies_dir, sid).name}",
+                flush=True,
+            )
+            print(
+                f"[SETUP] W{slot + 1} login user (masked): {_mask_login_hint(em_slot)}",
+                flush=True,
+            )
             print(f"[SETUP] Route: {proxy_desc}", flush=True)
             print(f"[SETUP] Fingerprint (sha256): {current_fp[:28]}…", flush=True)
+            _sync_session_file_with_proxy_fingerprint(
+                state_path,
+                fp_txt,
+                legacy_fp,
+                current_fp,
+                session_id=sid,
+                hint=proxy_desc,
+                announce=True,
+                announce_actions_only=False,
+            )
 
-        _sync_session_file_with_proxy_fingerprint(
-            state_path,
-            fp_txt,
-            legacy_fp,
-            current_fp,
+        binding_path = _session_binding_json_path(cookies_dir, sid)
+        cred_fp_slot = _credential_fingerprint(em_slot, pw_slot)
+        _sync_session_binding_for_slot(
+            state_path=state_path,
+            binding_path=binding_path,
+            fp_txt=fp_txt,
+            legacy_fp=legacy_fp,
+            current_url=(slot_http_urls[slot] or "").strip(),
+            current_account=credential_accounts[slot],
+            current_credential_fp=cred_fp_slot,
             session_id=sid,
-            hint=proxy_desc,
             announce=(slot in enabled_slot_indices),
         )
 
-    skipped_sid = [s + 1 for s in range(n_resource) if s not in enabled_slot_indices]
-    if skipped_sid:
+    idle_worker_idx = [w for w in range(n_resource) if w not in enabled_slot_indices]
+    if idle_worker_idx:
+        idle_accs = sorted({credential_accounts[w] for w in idle_worker_idx})
         print(
-            f"[SETUP] Slots idle this run ({', '.join(f'S{x}' for x in skipped_sid)}) — "
-            f"BOL_BROWSER_USE_SLOT_ENABLE_FLAGS=1 with those tabs off; session files on disk unchanged.",
+            f"[SETUP] Chromium not started for bol_account(s) {idle_accs} "
+            f"(slot flags off for those accounts); proxy/session disk checks still ran for all proxy rows.",
             flush=True,
         )
 
     if use_proxy and n_resource > 1:
         row_fps: list[str] = []
         for i in range(n_resource):
-            h, pt, u, pw = proxy_rows[i]
+            acc_i = credential_accounts[i]
+            h, pt, u, pw = proxy_rows[acc_i - 1]
             row_fps.append(_proxy_tuple_fingerprint(h, pt, u, pw))
         if len(set(row_fps)) < len(row_fps):
             print(
-                "[SETUP] Note: some proxy.txt lines use the **same** host:port:user:pass — "
+                "[SETUP] Note: some effective proxy rows use the **same** host:port:user:pass — "
                 "fingerprints match on purpose; Bol logins still stay separate (session_1.json vs session_2.json …).",
                 flush=True,
             )
@@ -4433,18 +5361,23 @@ def run_browser_mode_entry() -> None:
     threads: list[threading.Thread] = []
     enabled_sorted = tuple(sorted(enabled_slot_indices))
     for slot in enabled_slot_indices:
-        em_slot, pw_slot = _bol_credentials_for_slot(slot)
+        acc_n = credential_accounts[slot]
+        em_slot, pw_slot = _bol_credentials_for_account_number(acc_n)
         t = threading.Thread(
             target=_browser_slot_worker,
             kwargs={
                 "slot": slot,
                 "mod": mod,
                 "use_proxy": use_proxy,
+                "proxy_file": proxy_file,
                 "proxy_rows": proxy_rows,
                 "session_paths": session_paths,
                 "fp_bundles": fp_bundles,
                 "slot_http_urls": slot_http_urls,
+                "slot_url_pick_index": slot_url_pick_indices[slot],
+                "binding_account_num": credential_accounts[slot],
                 "sticky_slot_product_url": sticky_slot_product_url,
+                "allow_proxy_failover_other_lines": allow_proxy_failover_other_lines,
                 "email": em_slot,
                 "password": pw_slot,
                 "discord_webhook": discord_webhook,
@@ -4456,7 +5389,6 @@ def run_browser_mode_entry() -> None:
                 "channel": channel,
                 "shutdown_ev": shutdown_ev,
                 "login_outcomes": login_outcomes,
-                "failover_pool_lines": failover_pool_lines,
                 "enabled_slot_indices_sorted": enabled_sorted,
             },
             name=f"BolBrowserSlot{slot + 1}",
