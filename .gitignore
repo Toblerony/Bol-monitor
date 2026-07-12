@@ -1,0 +1,57 @@
+# ── Separate Target project (not part of Bol bot) ──
+target/
+
+# ── Secrets & env (never commit) ──
+.env
+.env.*
+!.env.example
+backend/.env
+backend/.env.*
+!backend/.env.example
+frontend/.env
+frontend/.env.*
+
+# ── Local IDE workspace ──
+*.code-workspace
+
+# ── Python / backend ──
+__pycache__/
+*.py[cod]
+*$py.class
+backend/venv/
+backend/.venv/
+backend/data/
+backend/playwright-browsers/
+*.sqlite3
+*.db
+backend/data/backend.pid
+
+# Session / browser profile (login cookies)
+backend/data/bol_session.json
+backend/data/bol_chrome_profile/
+**/bol_chrome_profile/
+
+# ── Node / frontend ──
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+*.tsbuildinfo
+
+# ── Logs & temp ──
+*.log
+npm-debug.log*
+yarn-debug.log*
+
+# ── OS ──
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── Optional local proxy file ──
+proxy.txt
+**/proxy.txt
+
+# ── Editor ──
+.vscode/*
+!.vscode/extensions.json
+.idea/

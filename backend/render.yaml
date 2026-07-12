@@ -1,0 +1,21 @@
+# Render Blueprint — backend only (frontend on Vercel)
+# Set in Render dashboard:
+#   DATABASE_URL  — Neon PostgreSQL connection string
+#   SECRET_KEY    — long random string
+#   CORS_ORIGINS  — https://your-frontend.vercel.app (and localhost if needed)
+
+services:
+  - type: web
+    name: bol-monitor-api
+    runtime: python
+    rootDir: backend
+    buildCommand: pip install -r requirements.txt && python scripts/ensure_playwright_chromium.py
+    startCommand: python run.py
+    envVars:
+      - key: RENDER
+        value: "true"
+      - key: PLAYWRIGHT_HEADLESS
+        value: "true"
+      - key: PYTHON_VERSION
+        value: "3.11.0"
+      # DATABASE_URL, SECRET_KEY, CORS_ORIGINS — set in Render dashboard

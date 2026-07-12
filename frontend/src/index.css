@@ -1,0 +1,142 @@
+@import "tailwindcss";
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+@theme {
+  --color-background: oklch(0.965 0.008 250);
+  --color-foreground: oklch(0.18 0.025 264);
+  --color-card: oklch(1 0 0);
+  --color-card-foreground: oklch(0.18 0.025 264);
+  --color-primary: oklch(0.48 0.18 255);
+  --color-primary-foreground: oklch(0.985 0 0);
+  --color-secondary: oklch(0.94 0.012 250);
+  --color-secondary-foreground: oklch(0.25 0.02 264);
+  --color-muted: oklch(0.935 0.012 250);
+  --color-muted-foreground: oklch(0.42 0.025 264);
+  --color-accent: oklch(0.92 0.015 250);
+  --color-accent-foreground: oklch(0.22 0.02 264);
+  --color-destructive: oklch(0.55 0.22 25);
+  --color-border: oklch(0.78 0.022 250);
+  --color-input: oklch(0.82 0.018 250);
+  --color-ring: oklch(0.48 0.18 255);
+  --color-success: oklch(0.52 0.16 145);
+  --color-warning: oklch(0.68 0.14 85);
+  --radius-lg: 0.75rem;
+  --radius-md: 0.5rem;
+  --radius-sm: 0.375rem;
+  --shadow-card: 0 1px 3px rgba(15, 23, 42, 0.07), 0 1px 2px rgba(15, 23, 42, 0.04);
+  --shadow-header: 0 1px 4px rgba(15, 23, 42, 0.06);
+}
+
+.dark {
+  --color-background: oklch(0.115 0.025 264);
+  --color-foreground: oklch(0.95 0.01 264);
+  --color-card: oklch(0.155 0.028 264);
+  --color-card-foreground: oklch(0.95 0.01 264);
+  --color-primary: oklch(0.62 0.19 255);
+  --color-primary-foreground: oklch(0.985 0 0);
+  --color-secondary: oklch(0.20 0.028 264);
+  --color-secondary-foreground: oklch(0.92 0.01 264);
+  --color-muted: oklch(0.20 0.025 264);
+  --color-muted-foreground: oklch(0.68 0.02 264);
+  --color-accent: oklch(0.22 0.03 264);
+  --color-accent-foreground: oklch(0.95 0.01 264);
+  --color-destructive: oklch(0.62 0.2 25);
+  --color-border: oklch(0.30 0.03 264);
+  --color-input: oklch(0.22 0.028 264);
+  --color-ring: oklch(0.62 0.19 255);
+  --color-success: oklch(0.65 0.17 145);
+  --color-warning: oklch(0.78 0.14 85);
+  --shadow-card: 0 2px 8px rgba(0, 0, 0, 0.35), 0 0 0 1px oklch(0.28 0.03 264);
+  --shadow-header: 0 1px 0 oklch(0.28 0.03 264), 0 4px 12px rgba(0, 0, 0, 0.4);
+}
+
+* {
+  border-color: var(--color-border);
+}
+
+body {
+  background: var(--color-background);
+  color: var(--color-foreground);
+  font-family: "Inter", system-ui, -apple-system, sans-serif;
+  margin: 0;
+  min-height: 100vh;
+}
+
+/* ── Light mode ── */
+html:not(.dark) body {
+  background: linear-gradient(165deg, oklch(0.975 0.006 250) 0%, oklch(0.948 0.012 255) 100%);
+}
+
+html:not(.dark) .bg-background {
+  background: transparent;
+}
+
+html:not(.dark) .bg-card {
+  box-shadow: var(--shadow-card);
+}
+
+html:not(.dark) input,
+html:not(.dark) select,
+html:not(.dark) textarea {
+  background: oklch(1 0 0);
+  border-color: oklch(0.75 0.025 250);
+}
+
+html:not(.dark) input:focus,
+html:not(.dark) select:focus,
+html:not(.dark) textarea:focus {
+  border-color: var(--color-primary);
+  box-shadow: 0 0 0 3px oklch(0.48 0.18 255 / 0.12);
+}
+
+/* ── Dark mode ── */
+html.dark body {
+  background: linear-gradient(165deg, oklch(0.11 0.028 264) 0%, oklch(0.09 0.022 270) 100%);
+}
+
+html.dark .bg-background {
+  background: transparent;
+}
+
+html.dark .bg-card {
+  box-shadow: var(--shadow-card);
+  border-color: oklch(0.28 0.03 264);
+}
+
+html.dark input,
+html.dark select,
+html.dark textarea {
+  background: oklch(0.18 0.028 264);
+  border-color: oklch(0.32 0.03 264);
+  color: oklch(0.95 0.01 264);
+}
+
+html.dark input:focus,
+html.dark select:focus,
+html.dark textarea:focus {
+  border-color: oklch(0.62 0.19 255);
+  box-shadow: 0 0 0 3px oklch(0.62 0.19 255 / 0.2);
+}
+
+html.dark input::placeholder,
+html.dark textarea::placeholder {
+  color: oklch(0.55 0.02 264);
+}
+
+@keyframes fade-in {
+  from { opacity: 0; transform: translateY(4px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.animate-fade-in {
+  animation: fade-in 0.25s ease-out;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+.animate-spin {
+  animation: spin 1s linear infinite;
+}
