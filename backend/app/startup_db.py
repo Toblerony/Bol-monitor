@@ -52,6 +52,8 @@ def run_blocking_startup(settings: Settings) -> None:
     db = SessionLocal()
     try:
         seed_database(db, settings.ADMIN_EMAIL.strip(), settings.ADMIN_PASSWORD)
+        if settings.ADMIN_EMAIL.strip() and settings.ADMIN_PASSWORD:
+            logger.info("Admin credentials synced from environment for %s", settings.ADMIN_EMAIL.strip().lower())
         ensure_visible_browser_setting(db)
         mon = db.query(MonitoringSetting).first()
         if mon:
