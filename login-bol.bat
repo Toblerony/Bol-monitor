@@ -26,6 +26,8 @@ if errorlevel 1 (
 )
 
 echo.
-echo [2/2] Opening Bol login browser...
+echo [2/2] Opening Bol login / checking saved session...
+echo If a valid session is already in Neon, it will reuse it (no re-login).
+echo To force a new login: python scripts\bol_login_sync.py --force
 python scripts\bol_login_sync.py
 pause

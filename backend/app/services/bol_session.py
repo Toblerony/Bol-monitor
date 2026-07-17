@@ -383,59 +383,154 @@ async def _maximize_browser_window(page: Page) -> None:
 
 
 async def open_bol_login_browser(cfg: Settings | None = None) -> bool:
-    """Visible Chromium for login-bol.bat — opens bol.com immediately, user logs in manually."""
+    """Visible Chromium for login-bol.bat — opens bol.com immediately, user logs in manually.
+
+    Uses Proxies page settings when enabled (same pool as monitor) so login works if
+    the home IP is blocked by bol.com.
+    """
     from playwright.async_api import async_playwright
 
+    from app.database import SessionLocal
     from app.playwright_browsers import configure_playwright_browsers_path, ensure_chromium_installed
+    from app.services.proxy_client import ParsedProxy
+    from app.services.proxy_service import load_pool_from_db
 
     cfg = cfg or get_settings()
     configure_playwright_browsers_path()
     exe = ensure_chromium_installed(quiet=True)
-    sf = session_file(cfg)
+
+    pool = None
+    db = SessionLocal()
+    try:
+        pool = load_pool_from_db(db)
+    finally:
+        db.close()
+
+    proxy_attempts: list[ParsedProxy | None]
+    if pool is not None and pool.enabled:
+        proxy_attempts = []
+        seen: set[str] = set()
+        for _ in range(min(pool.count, 5)):
+            p = pool.next()
+            if p is None or p.raw in seen:
+                continue
+            seen.add(p.raw)
+            proxy_attempts.append(p)
+        if not proxy_attempts:
+            proxy_attempts = [None]
+        print(f"\nProxies ON — will try up to {len(proxy_attempts)} proxy(ies) for login.")
+    else:
+        proxy_attempts = [None]
+        print("\nProxies OFF — direct connection (enable Proxies page if IP blocked).")
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=False,
-            executable_path=str(exe),
-            args=["--start-maximized", "--window-position=0,0"],
-        )
-        context_kwargs: dict = {"locale": "nl-NL", "no_viewport": True}
-        if sf.is_file() and sf.stat().st_size > 20:
-            context_kwargs["storage_state"] = str(sf)
+        for attempt_i, proxy in enumerate(proxy_attempts, start=1):
+            launch_kwargs: dict = {
+                "headless": False,
+                "executable_path": str(exe),
+                "args": ["--start-maximized", "--window-position=0,0"],
+            }
+            if proxy is not None:
+                launch_kwargs["proxy"] = proxy.playwright_proxy
+                print(
+                    f"\n[{attempt_i}/{len(proxy_attempts)}] Opening browser via proxy "
+                    f"{proxy.label or proxy.host}:{proxy.port} …"
+                )
+            else:
+                print(f"\n[{attempt_i}/{len(proxy_attempts)}] Opening browser (direct) …")
 
-        context = await browser.new_context(**context_kwargs)
-        page = await context.new_page()
-        await _maximize_browser_window(page)
+            browser = await p.chromium.launch(**launch_kwargs)
+            try:
+                # Fresh login window — do NOT reload old storage_state.
+                # Old DB session is separate; clear only if you want to wipe it after a new login.
+                context_kwargs: dict = {"locale": "nl-NL", "no_viewport": True}
 
-        print(f"\nOpening {BOL_HOME_URL} …")
-        await page.goto(BOL_HOME_URL, wait_until="domcontentloaded", timeout=120000)
-        await _maximize_browser_window(page)
-        await asyncio.sleep(1.0)
+                context = await browser.new_context(**context_kwargs)
+                page = await context.new_page()
+                await _maximize_browser_window(page)
 
-        for _ in range(6):
-            if await dismiss_bol_cookie_popup(page):
-                print("Cookie popup dismissed — click Inloggen in the header to log in.")
-                break
-            await asyncio.sleep(0.5)
+                print(f"Opening {BOL_HOME_URL} …")
+                try:
+                    await page.goto(BOL_HOME_URL, wait_until="domcontentloaded", timeout=120000)
+                except Exception as exc:
+                    print(f"Navigate failed: {exc}")
+                    if proxy is not None and pool is not None:
+                        pool.mark_failed(proxy, reason=str(exc)[:80])
+                    await context.close()
+                    await browser.close()
+                    continue
 
-        print("\nChromium is open (maximized) — complete these steps in the browser:")
-        print("  1. Accept cookies if still shown")
-        print("  2. Click Inloggen (top right)")
-        print("  3. Log in with your bol.com account")
-        print("  4. Wait until header shows Welkom <your name>")
-        print("\nBot is paused — waiting up to 15 minutes for login…\n")
+                await _maximize_browser_window(page)
+                await asyncio.sleep(1.0)
 
-        ok = await wait_passive_for_bol_login(context, page, timeout_seconds=900)
-        if ok:
-            await asyncio.sleep(POST_LOGIN_SETTLE_SECONDS)
-            await save_session(context, cfg)
-            print("\nLogin detected (Welkom in header) — session saved.")
-        else:
-            print("\nTimed out — complete bol.com login and run login-bol.bat again.")
+                body = ""
+                try:
+                    body = (await page.content())[:80000].lower()
+                except Exception:
+                    pass
+                title = ""
+                try:
+                    title = (await page.title() or "").lower()
+                except Exception:
+                    pass
+                blocked = any(
+                    x in body or x in title
+                    for x in ("ip-geblokkeerd", "access denied", "geblokkeerd")
+                )
+                if blocked:
+                    print("Bol shows IP blocked on this connection.")
+                    if proxy is not None and pool is not None:
+                        pool.mark_failed(proxy, reason="ip-geblokkeerd")
+                        print("Rotating to next proxy…")
+                        await context.close()
+                        await browser.close()
+                        continue
+                    print("Enable proxies in the dashboard (Proxies page) and run login-bol.bat again.")
+                    await context.close()
+                    await browser.close()
+                    return False
 
-        await context.close()
-        await browser.close()
-        return ok
+                if proxy is not None and pool is not None:
+                    pool.mark_ok(proxy)
+
+                for _ in range(6):
+                    if await dismiss_bol_cookie_popup(page):
+                        print("Cookie popup dismissed — click Inloggen in the header to log in.")
+                        break
+                    await asyncio.sleep(0.5)
+
+                print("\nChromium is open (maximized) — complete these steps in the browser:")
+                print("  1. Accept cookies if still shown")
+                print("  2. Click Inloggen (top right)")
+                print("  3. Log in with your bol.com account")
+                print("  4. Wait until header shows Welkom <your name>")
+                print("\nBot is paused — waiting up to 15 minutes for login…\n")
+
+                ok = await wait_passive_for_bol_login(context, page, timeout_seconds=900)
+                if ok:
+                    await asyncio.sleep(POST_LOGIN_SETTLE_SECONDS)
+                    await save_session(context, cfg)
+                    print("\nLogin detected (Welkom in header) — session saved.")
+                else:
+                    print("\nTimed out — complete bol.com login and run login-bol.bat again.")
+
+                await context.close()
+                await browser.close()
+                return ok
+            except Exception as exc:
+                logger.warning("Login browser attempt failed: %s", exc)
+                print(f"Browser attempt failed: {exc}")
+                try:
+                    await browser.close()
+                except Exception:
+                    pass
+                if proxy is not None and pool is not None:
+                    pool.mark_failed(proxy, reason=str(exc)[:80])
+                continue
+
+        print("\nAll proxy/direct attempts failed (IP blocked or network error).")
+        print("Check Proxies page — enable Use proxies and add working residential lines.")
+        return False
 
 
 def check_bol_session_still_valid_sync(cfg: Settings | None = None) -> bool:
@@ -457,16 +552,30 @@ def check_bol_session_still_valid_sync(cfg: Settings | None = None) -> bool:
 async def _verify_stored_session_async(cfg: Settings, sf: Path) -> bool:
     from playwright.async_api import async_playwright
 
+    from app.database import SessionLocal
     from app.playwright_browsers import configure_playwright_browsers_path, ensure_chromium_installed
     from app.services.browser_settings import get_playwright_headless
+    from app.services.proxy_service import load_pool_from_db
 
     configure_playwright_browsers_path()
     exe = ensure_chromium_installed(quiet=True)
+
+    launch_kwargs: dict = {
+        "headless": get_playwright_headless(),
+        "executable_path": str(exe),
+    }
+    db = SessionLocal()
+    try:
+        pool = load_pool_from_db(db)
+        if pool is not None and pool.enabled:
+            proxy = pool.next()
+            if proxy is not None:
+                launch_kwargs["proxy"] = proxy.playwright_proxy
+    finally:
+        db.close()
+
     async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=get_playwright_headless(),
-            executable_path=str(exe),
-        )
+        browser = await p.chromium.launch(**launch_kwargs)
         try:
             context = await browser.new_context(storage_state=str(sf), locale="nl-NL")
             page = await context.new_page()

@@ -37,6 +37,16 @@ class ParsedProxy:
     def urllib_url(self) -> str:
         return f"http://{self.username}:{self.password}@{self.host}:{self.port}"
 
+    @property
+    def playwright_proxy(self) -> dict[str, str]:
+        """Playwright launch/context proxy dict."""
+        cfg: dict[str, str] = {"server": f"http://{self.host}:{self.port}"}
+        if self.username:
+            cfg["username"] = self.username
+        if self.password:
+            cfg["password"] = self.password
+        return cfg
+
     def opener(self) -> OpenerDirector:
         handler = urllib.request.ProxyHandler({"http": self.urllib_url, "https": self.urllib_url})
         ctx = ssl.create_default_context()
