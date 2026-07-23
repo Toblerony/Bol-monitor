@@ -1,4 +1,4 @@
-"""Playwright headless on Render; visible browser on local PC (login-bol.bat)."""
+"""Playwright headless on Render; visible browser on local PC (Settings → Login to Bol)."""
 from __future__ import annotations
 
 import os

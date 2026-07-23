@@ -52,7 +52,7 @@ export function MonitoringProvider({ children }: { children: ReactNode }) {
       if (!session.has_session || !session.has_database) {
         toast(
           session.message ||
-            "No Bol session saved. Run login-bol.bat first, log in to bol.com, then click Start.",
+            "No Bol session saved. Open Settings → Login to Bol, then click Start.",
           "error",
         )
         await refresh()
@@ -66,7 +66,7 @@ export function MonitoringProvider({ children }: { children: ReactNode }) {
       toast("Monitoring started", "success")
       await refresh()
     } catch (err: unknown) {
-      toast(apiErrorMessage(err, "Start failed — save Bol session with login-bol.bat first"), "error")
+      toast(apiErrorMessage(err, "Start failed — Settings → Login to Bol first"), "error")
     } finally {
       setToggling(false)
     }

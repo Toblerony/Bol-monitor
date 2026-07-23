@@ -11,7 +11,7 @@ Usage (from backend/):
   python scripts/test_bol_stock.py --url URL    # test one URL
   python scripts/test_bol_stock.py --urls-file urls.txt
 
-Uses login-bol.bat session cookies + proxies from DB when available.
+Uses Settings → Login to Bol session cookies + proxies from DB when available.
 """
 from __future__ import annotations
 
@@ -313,7 +313,7 @@ def main() -> int:
 
     pool = None if args.no_proxy else _load_pool()
     has_cookie = bool(_cookie_header())
-    print(f"  Session cookies: {'yes' if has_cookie else 'no (run login-bol.bat if 403)'}")
+    print(f"  Session cookies: {'yes' if has_cookie else 'no (Settings → Login to Bol if 403)'}")
     print(f"  Proxy pool: {'yes' if pool and pool.enabled else 'no'}")
     print()
 
@@ -324,7 +324,7 @@ def main() -> int:
         print("=" * 70, flush=True)
         print(f"  Found {len(found)} products with clear stock status")
         if len(found) < 4:
-            print("  Tip: enable proxies or run login-bol.bat if many URLs show offline/403")
+            print("  Tip: enable proxies or Settings → Login to Bol if many URLs show offline/403")
         print("=" * 70, flush=True)
         return 0 if found else 1
 

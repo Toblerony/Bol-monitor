@@ -91,12 +91,12 @@ async def main() -> int:
         if ok and status.get("has_session"):
             print("\nSUCCESS — Bol session saved to Neon database.")
             print("Dashboard: Start monitoring (header Start button).")
-            print("Next time you run login-bol.bat it will reuse this session if still valid.")
+            print("Next time use Settings → Login to Bol; it will reuse this session if still valid.")
             return 0
         if status.get("has_session") and not ok:
             print("\nWARNING — login did not finish, but an older session is still in the database.")
             print("If that old session still works, use Start monitoring.")
-            print("If not: Settings → Clear Bol session, then run login-bol.bat again.")
+            print("If not: Settings → Clear Bol session, then Login to Bol again.")
             return 1
         print("\nFAILED — login not completed. Header must show Welkom <name>.")
         return 1

@@ -1,9 +1,10 @@
-import { FormEvent, useEffect, useState } from "react"
-import { ChevronDown, ChevronRight, Shield, Send, Trash2, MessageSquare } from "lucide-react"
+import { FormEvent, useEffect, useRef, useState } from "react"
+import { ChevronDown, ChevronRight, LogIn, Shield, Send, Trash2, MessageSquare } from "lucide-react"
 import {
   clearBolSession,
   getBolLoginStatus,
   getMonitoring,
+  startBolLogin,
   testDiscord,
   testTelegram,
   updateMonitoring,
@@ -25,14 +26,24 @@ export default function SettingsPage() {
     message: string
   } | null>(null)
   const [clearing, setClearing] = useState(false)
+  const [loggingIn, setLoggingIn] = useState(false)
   const [saving, setSaving] = useState(false)
   const [testingDiscord, setTestingDiscord] = useState(false)
   const [testingTelegram, setTestingTelegram] = useState(false)
+  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const { toast } = useToast()
 
   async function loadBolStatus() {
     const { data } = await getBolLoginStatus()
     setBolSession(data)
+    return data
+  }
+
+  function stopLoginPoll() {
+    if (pollRef.current) {
+      clearInterval(pollRef.current)
+      pollRef.current = null
+    }
   }
 
   useEffect(() => {
@@ -50,6 +61,7 @@ export default function SettingsPage() {
       })
     })
     loadBolStatus()
+    return () => stopLoginPoll()
   }, [])
 
   async function save(e: FormEvent) {
@@ -109,13 +121,45 @@ export default function SettingsPage() {
     }
   }
 
+  async function handleLoginBol() {
+    setLoggingIn(true)
+    try {
+      const { data } = await startBolLogin()
+      toast(data.message || "Chromium opening…", "success")
+      stopLoginPoll()
+      let ticks = 0
+      pollRef.current = setInterval(async () => {
+        ticks += 1
+        try {
+          const status = await loadBolStatus()
+          if (status?.logged_in) {
+            stopLoginPoll()
+            setLoggingIn(false)
+            toast("Bol session saved — you can Start monitoring", "success")
+          } else if (ticks >= 180) {
+            stopLoginPoll()
+            setLoggingIn(false)
+            toast("Still waiting for login — check the Chromium window", "error")
+          }
+        } catch {
+          /* keep polling */
+        }
+      }, 3000)
+    } catch (err) {
+      setLoggingIn(false)
+      toast(apiErrorMessage(err, "Could not open Bol login"), "error")
+    }
+  }
+
   async function handleClearSession() {
-    if (!confirm("Delete Bol session?\n\nRun login-bol.bat on your PC to sign in again.")) return
+    if (!confirm("Delete Bol session?\n\nYou can log in again from Settings → Login to Bol.")) return
     setClearing(true)
+    stopLoginPoll()
+    setLoggingIn(false)
     try {
       await clearBolSession()
       await loadBolStatus()
-      toast("Session cleared — run login-bol.bat", "success")
+      toast("Session cleared — click Login to Bol", "success")
     } catch {
       toast("Failed to clear session", "error")
     } finally {
@@ -129,21 +173,26 @@ export default function SettingsPage() {
     <div className="space-y-6 max-w-3xl animate-fade-in">
       <div>
         <h1 className="text-2xl font-bold">Settings</h1>
-        <p className="text-muted-foreground text-sm mt-1">Discord alerts, optional Telegram, Bol session, monitoring speed</p>
+        <p className="text-muted-foreground text-sm mt-1">Bol login, Discord alerts, optional Telegram, monitoring speed</p>
       </div>
 
       <Card>
         <CardHeader>
           <CardTitle className="flex items-center gap-2 text-base"><Shield className="h-4 w-4" /> Bol session</CardTitle>
-          <CardDescription>Same DATABASE_URL on PC and Render — login once with login-bol.bat</CardDescription>
+          <CardDescription>
+            Login opens Chromium on this PC. Cookies save to Neon so Render can reuse the same session.
+          </CardDescription>
         </CardHeader>
         <CardContent className="space-y-3">
           {bolSession ? (
             <>
-              <p className={bolSession.has_session ? "text-success text-sm font-medium" : "text-warning text-sm font-medium"}>
+              <p className={bolSession.logged_in ? "text-success text-sm font-medium" : "text-warning text-sm font-medium"}>
                 {bolSession.message}
               </p>
               <div className="flex flex-wrap gap-2">
+                <Badge variant={bolSession.logged_in ? "success" : "secondary"}>
+                  {bolSession.logged_in ? "Logged in" : "Not logged in"}
+                </Badge>
                 <Badge variant={bolSession.has_database ? "success" : "secondary"}>Database {bolSession.has_database ? "OK" : "missing"}</Badge>
                 <Badge variant={bolSession.has_file ? "success" : "secondary"}>Local file {bolSession.has_file ? "OK" : "missing"}</Badge>
               </div>
@@ -152,15 +201,26 @@ export default function SettingsPage() {
             <Spinner />
           )}
           <ol className="text-xs text-muted-foreground list-decimal list-inside space-y-1 border rounded-lg p-3 bg-muted/30">
-            <li>Paste Neon DATABASE_URL in backend/.env</li>
-            <li>Double-click <strong>login-bol.bat</strong></li>
-            <li>Log in to bol.com in Chromium</li>
-            <li>Dashboard → Start monitoring</li>
+            <li>Use the same Neon <strong>DATABASE_URL</strong> on PC and Render</li>
+            <li>Click <strong>Login to Bol</strong> (Chromium opens)</li>
+            <li>Sign in on bol.com until the header shows <strong>Welkom</strong></li>
+            <li>Dashboard → <strong>Start monitoring</strong></li>
           </ol>
-          <Button variant="outline" size="sm" className="text-destructive border-destructive/30" onClick={handleClearSession} disabled={clearing}>
-            {clearing ? <Spinner className="h-4 w-4" /> : <Trash2 className="h-4 w-4" />}
-            Clear Bol session
-          </Button>
+          <div className="flex flex-wrap gap-2">
+            <Button type="button" size="sm" onClick={handleLoginBol} disabled={loggingIn || clearing}>
+              {loggingIn ? <Spinner className="h-4 w-4" /> : <LogIn className="h-4 w-4" />}
+              {loggingIn ? "Waiting for Welkom…" : "Login to Bol"}
+            </Button>
+            <Button variant="outline" size="sm" className="text-destructive border-destructive/30" onClick={handleClearSession} disabled={clearing || loggingIn}>
+              {clearing ? <Spinner className="h-4 w-4" /> : <Trash2 className="h-4 w-4" />}
+              Clear Bol session
+            </Button>
+          </div>
+          {loggingIn && (
+            <p className="text-xs text-muted-foreground">
+              Keep the Chromium window open. When Welkom appears, cookies are saved automatically.
+            </p>
+          )}
         </CardContent>
       </Card>
 

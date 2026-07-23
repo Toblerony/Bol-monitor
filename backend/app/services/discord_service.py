@@ -57,7 +57,7 @@ def embed_in_stock(title: str, url: str, price: str | None, profile_name: str) -
 
 
 def embed_session_logout() -> tuple[str, dict]:
-    content = "⚠️ **Bol session expired** — run login-bol.bat on your PC and log in again."
+    content = "⚠️ **Bol session expired** — open Settings → Login to Bol on your PC and sign in again."
     embed = {
         "title": "Bol session expired",
         "color": 16776960,

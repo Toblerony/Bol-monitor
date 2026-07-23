@@ -43,12 +43,12 @@ if errorlevel 1 (
 )
 
 echo.
-echo [4/4] Playwright Chromium (~180 MB, required for login-bol.bat)...
+echo [4/4] Playwright Chromium (~180 MB, required for Settings - Login to Bol)...
 cd ..\backend
 set PLAYWRIGHT_BROWSERS_PATH=%~dp0backend\playwright-browsers
 python scripts\ensure_playwright_chromium.py
 if errorlevel 1 (
-    echo Chromium install failed. Check internet and run install-chromium.bat
+    echo Chromium install failed. Check internet and re-run setup.bat
     pause
     exit /b 1
 )
@@ -58,8 +58,9 @@ echo ========================================
 echo  Setup complete!
 echo.
 echo  1. Paste Neon DATABASE_URL in backend\.env (same URL on Render)
-echo  2. Double-click login-bol.bat — log in to bol.com once
-echo  3. Double-click startall.bat
-echo  4. Open http://localhost:5175 — add profiles, Telegram, Start
+echo  2. Double-click startall.bat
+echo  3. Open http://localhost:5175
+echo  4. Settings -^> Login to Bol — sign in until Welkom
+echo  5. Add profiles, Discord/Telegram, Start monitoring
 echo ========================================
 pause

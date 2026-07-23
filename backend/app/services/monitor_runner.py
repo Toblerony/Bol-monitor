@@ -142,6 +142,15 @@ class MonitorRunner:
         last_sitemap = 0.0
         next_product_idx = 0
         session_check_interval = 600.0
+        # Do not flash Chromium on Start — first action is sitemap, then quiet headless checks
+        self._last_session_check = time.time()
+
+        log_activity(
+            "info",
+            "Monitor running — starting sitemap scan, then product page visits (no login browser needed)",
+            category=LogCategory.MONITORING,
+            source="monitor_runner",
+        )
 
         while not self._stop.is_set():
             db = SessionLocal()
@@ -207,10 +216,10 @@ class MonitorRunner:
             return
 
         mon.bol_session_ok = False
-        mon.bol_session_message = "Bol session expired — run login-bol.bat on your PC"
+        mon.bol_session_message = "Bol session expired — Settings → Login to Bol on your PC"
         log_activity(
             "warning",
-            "Bol session expired or logged out — run login-bol.bat (no auto-login)",
+            "Bol session expired or logged out — Settings → Login to Bol (no auto-login)",
             category=LogCategory.SYSTEM,
             source="monitor_runner",
         )

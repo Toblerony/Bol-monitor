@@ -70,7 +70,7 @@ def ensure_chromium_installed(*, quiet: bool = False) -> Path:
     )
     if result.returncode != 0:
         raise RuntimeError(
-            "Playwright Chromium install failed. Check internet and run install-chromium.bat"
+            "Playwright Chromium install failed. Check internet and re-run setup.bat"
         )
 
     exe = chromium_executable()

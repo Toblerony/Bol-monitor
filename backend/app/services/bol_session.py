@@ -3,14 +3,16 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
 import shutil
+import threading
 import time
 from pathlib import Path
 
 from playwright.async_api import BrowserContext, Page
 
-from app.config import Settings, get_settings
+from app.config import Settings, get_settings, is_cloud_host
 
 logger = logging.getLogger(__name__)
 
@@ -19,6 +21,9 @@ BOL_HOME_URL = "https://www.bol.com/nl/nl/"
 PASSIVE_LOGIN_POLL_SECONDS = 2
 POST_LOGIN_SETTLE_SECONDS = 3
 
+_login_lock = threading.Lock()
+_login_running = False
+
 _ACCEPT_BUTTON = re.compile(
     r"^(Accept\s+all|Accept|Allow\s+all|Agree|OK|Alles\s+accepteren|"
     r"Alle\s+cookies\s+accepteren|Ik\s+ga\s+akkoord)$",
@@ -26,6 +31,55 @@ _ACCEPT_BUTTON = re.compile(
 )
 _INLOGGEN = re.compile(r"^\s*Inloggen\s*$", re.I)
 _LOG_IN = re.compile(r"^\s*Log\s+in\s*$", re.I)
+
+
+def is_bol_login_running() -> bool:
+    with _login_lock:
+        return _login_running
+
+
+def start_bol_login_browser_background() -> tuple[bool, str]:
+    """
+    Open visible Chromium for bol.com login (Settings → Login to Bol).
+    Returns (started_ok, message). Runs in a daemon thread; session saves to Neon.
+    """
+    global _login_running
+
+    if is_cloud_host():
+        return (
+            False,
+            "Bol login browser must run on your PC (not on Render). "
+            "Start the backend locally, open Settings → Login to Bol, "
+            "then the session is saved to Neon for the server.",
+        )
+
+    with _login_lock:
+        if _login_running:
+            return False, "Login browser is already open — finish signing in until Welkom appears"
+        _login_running = True
+
+    def _worker() -> None:
+        global _login_running
+        os.environ["BOL_LOGIN_MODE"] = "1"
+        try:
+            ok = asyncio.run(open_bol_login_browser())
+            if ok:
+                logger.info("Bol UI login finished — session saved")
+            else:
+                logger.warning("Bol UI login ended without a valid session")
+        except Exception as exc:
+            logger.exception("Bol UI login failed: %s", exc)
+        finally:
+            os.environ.pop("BOL_LOGIN_MODE", None)
+            with _login_lock:
+                _login_running = False
+
+    threading.Thread(target=_worker, name="bol-login-ui", daemon=True).start()
+    return (
+        True,
+        "Chromium is opening — log in to bol.com until the header shows Welkom. "
+        "Session cookies save automatically to Neon.",
+    )
 
 
 def session_file(cfg: Settings | None = None) -> Path:
@@ -170,7 +224,7 @@ def get_bol_session_status() -> dict:
     if has_session:
         message = "Bol session OK — saved in database" if db_ok else "Bol session OK — local file only"
     else:
-        message = "No Bol session — run login-bol.bat on your PC (same DATABASE_URL as Render)"
+        message = "No Bol session — Settings → Login to Bol on your PC (same DATABASE_URL as Render)"
     return {
         "has_session": has_session,
         "has_file": file_ok,
@@ -181,12 +235,12 @@ def get_bol_session_status() -> dict:
 
 
 SESSION_REQUIRED_MSG = (
-    "No Bol session saved. Run login-bol.bat on your PC, log in to bol.com, "
+    "No Bol session saved. Open Settings → Login to Bol on your PC, log in to bol.com, "
     "then click Start again. (Use the same DATABASE_URL as Render.)"
 )
 
 SESSION_DB_REQUIRED_MSG = (
-    "Bol session is not in the database. Run login-bol.bat on your PC, log in to bol.com, "
+    "Bol session is not in the database. Open Settings → Login to Bol on your PC, log in to bol.com, "
     "then click Start again. (Use the same DATABASE_URL as Render.)"
 )
 
@@ -383,7 +437,7 @@ async def _maximize_browser_window(page: Page) -> None:
 
 
 async def open_bol_login_browser(cfg: Settings | None = None) -> bool:
-    """Visible Chromium for login-bol.bat — opens bol.com immediately, user logs in manually.
+    """Visible Chromium for Settings → Login to Bol — opens bol.com, user logs in manually.
 
     Uses Proxies page settings when enabled (same pool as monitor) so login works if
     the home IP is blocked by bol.com.
@@ -485,7 +539,7 @@ async def open_bol_login_browser(cfg: Settings | None = None) -> bool:
                         await context.close()
                         await browser.close()
                         continue
-                    print("Enable proxies in the dashboard (Proxies page) and run login-bol.bat again.")
+                    print("Enable proxies in the dashboard (Proxies page) and Login to Bol again.")
                     await context.close()
                     await browser.close()
                     return False
@@ -512,7 +566,7 @@ async def open_bol_login_browser(cfg: Settings | None = None) -> bool:
                     await save_session(context, cfg)
                     print("\nLogin detected (Welkom in header) — session saved.")
                 else:
-                    print("\nTimed out — complete bol.com login and run login-bol.bat again.")
+                    print("\nTimed out — complete bol.com login (Settings → Login to Bol) again.")
 
                 await context.close()
                 await browser.close()
@@ -550,18 +604,18 @@ def check_bol_session_still_valid_sync(cfg: Settings | None = None) -> bool:
 
 
 async def _verify_stored_session_async(cfg: Settings, sf: Path) -> bool:
+    """Quiet headless check only — never open a visible Chromium window."""
     from playwright.async_api import async_playwright
 
     from app.database import SessionLocal
     from app.playwright_browsers import configure_playwright_browsers_path, ensure_chromium_installed
-    from app.services.browser_settings import get_playwright_headless
     from app.services.proxy_service import load_pool_from_db
 
     configure_playwright_browsers_path()
     exe = ensure_chromium_installed(quiet=True)
 
     launch_kwargs: dict = {
-        "headless": get_playwright_headless(),
+        "headless": True,
         "executable_path": str(exe),
     }
     db = SessionLocal()

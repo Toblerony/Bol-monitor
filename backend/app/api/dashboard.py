@@ -42,7 +42,9 @@ from app.services.bol_session import (
     assert_bol_session_for_start,
     clear_bol_browser_data,
     get_bol_session_status,
+    is_bol_login_running,
     session_status_message,
+    start_bol_login_browser_background,
     update_monitoring_session_flag,
 )
 
@@ -434,12 +436,24 @@ def bol_login_status(_: User = Depends(get_current_user), db: Session = Depends(
     mon.bol_session_ok = ok
     mon.bol_session_message = msg
     db.commit()
-    return BolLoginStatusResponse(**{**status, "message": msg, "logged_in": ok})
+    payload = {**status, "message": msg, "logged_in": ok}
+    if is_bol_login_running():
+        payload["message"] = "Login browser open — sign in until Welkom appears, then wait for save"
+    return BolLoginStatusResponse(**payload)
+
+
+@router.post("/bol/login")
+def start_bol_login(_: User = Depends(get_current_user)):
+    """Open Chromium on this machine for bol.com login; cookies save to Neon."""
+    started, message = start_bol_login_browser_background()
+    if not started:
+        raise HTTPException(status_code=400, detail=message)
+    return {"message": message, "login_running": True}
 
 
 @router.post("/bol/clear-session")
 def clear_bol_session(_: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    """Delete Bol session file + DB row — run login-bol.bat again."""
+    """Delete Bol session file + DB row — login again from Settings."""
     monitor_runner.stop()
     mon = _mon(db)
     mon.is_enabled = False
@@ -449,7 +463,7 @@ def clear_bol_session(_: User = Depends(get_current_user), db: Session = Depends
     update_monitoring_session_flag(db)
     db.commit()
     return {
-        "message": "Bol session cleared — run login-bol.bat on your PC, then Start monitoring",
+        "message": "Bol session cleared — Settings → Login to Bol, then Start monitoring",
         "cleared": result["session_file"] or result["profile_dir"],
         "details": result,
     }

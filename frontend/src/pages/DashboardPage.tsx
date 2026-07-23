@@ -74,7 +74,7 @@ export default function DashboardPage() {
           to="/settings"
           icon={Shield}
           label="Bol session"
-          value={stats?.bol_session_ok ? "Connected" : "Run login-bol.bat"}
+          value={stats?.bol_session_ok ? "Connected" : "Settings → Login to Bol"}
           iconClass={stats?.bol_session_ok ? "bg-success/10 text-success" : "bg-warning/10 text-warning"}
         />
         <InfoCard

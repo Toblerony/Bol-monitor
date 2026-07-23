@@ -30,7 +30,7 @@ def normalize_database_url(url: str) -> str:
     if not u:
         raise ValueError(
             "DATABASE_URL is empty — paste your Neon connection string in backend/.env "
-            "(same URL on PC and Render; login-bol.bat saves session to this DB)."
+            "(same URL on PC and Render; Settings → Login to Bol saves session to this DB)."
         )
     if u.startswith("sqlite"):
         return resolve_sqlite_database_url(u)
@@ -51,7 +51,7 @@ class Settings(BaseSettings):
     APP_VERSION: str = "1.0.0"
     DEBUG: bool = False
 
-    # Set in backend/.env — Neon URL required (same on PC + Render for login-bol.bat session sync)
+    # Set in backend/.env — Neon URL required (same on PC + Render for Settings login session sync)
     DATABASE_URL: str = ""
     API_PORT: int = 8003
 

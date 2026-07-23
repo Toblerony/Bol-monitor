@@ -84,6 +84,7 @@ export const getProxies = () => api.get("/proxies")
 export const updateProxies = (data: Record<string, unknown>) => api.put("/proxies", data)
 export const testProxies = () => api.post("/proxies/test")
 export const getBolLoginStatus = () => api.get("/bol/login-status")
+export const startBolLogin = () => api.post<{ message: string; login_running: boolean }>("/bol/login")
 export const clearBolSession = () => api.post("/bol/clear-session")
 
 export interface Profile {

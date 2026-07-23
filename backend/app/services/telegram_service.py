@@ -69,7 +69,7 @@ def format_session_logout_alert() -> str:
         "⚠️ <b>Bol session expired</b>\n\n"
         "You are logged out of bol.com on the server.\n"
         "The bot does <b>not</b> auto-login.\n\n"
-        "On your PC run <b>login-bol.bat</b>, log in manually, then Start monitoring again."
+        "On your PC open <b>Settings → Login to Bol</b>, log in manually, then Start monitoring again."
     )
 
 
