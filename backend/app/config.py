@@ -70,8 +70,8 @@ class Settings(BaseSettings):
 
     USE_PROXIES: bool = False
     SITEMAP_SCAN_INTERVAL_SEC: float = 600.0
-    POLL_ONLINE_MIN: float = 4.0
-    POLL_ONLINE_MAX: float = 8.0
+    POLL_ONLINE_MIN: float = 5.0
+    POLL_ONLINE_MAX: float = 10.0
     POLL_OFFLINE_MIN: float = 40.0
     POLL_OFFLINE_MAX: float = 60.0
 

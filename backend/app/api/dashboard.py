@@ -173,6 +173,12 @@ def update_monitoring_settings(
         val = getattr(data, field)
         if val is not None:
             setattr(mon, field, val)
+    # Product page visit interval: random between min/max, clamped 5–15s
+    mon.poll_online_min = max(5.0, min(15.0, float(mon.poll_online_min or 5.0)))
+    mon.poll_online_max = max(5.0, min(15.0, float(mon.poll_online_max or 10.0)))
+    if mon.poll_online_max < mon.poll_online_min:
+        mon.poll_online_max = mon.poll_online_min
+    mon.sitemap_scan_interval_sec = max(300.0, min(900.0, float(mon.sitemap_scan_interval_sec or 600.0)))
     db.commit()
     db.refresh(mon)
     return MonitoringSettingsResponse(

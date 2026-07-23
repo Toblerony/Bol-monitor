@@ -28,6 +28,17 @@ from app.services.alert_service import send_in_stock_alert, send_new_online_aler
 
 SITEMAP_INTERVAL_MIN_SEC = 300.0  # 5 minutes
 SITEMAP_INTERVAL_MAX_SEC = 900.0  # 15 minutes
+# Product page visits (bol.com PDP HTML — NOT Target Redsky)
+PDP_POLL_MIN_SEC = 5.0
+PDP_POLL_MAX_SEC = 15.0
+
+
+def _clamp_pdp_poll(lo: float, hi: float) -> tuple[float, float]:
+    lo = max(PDP_POLL_MIN_SEC, min(PDP_POLL_MAX_SEC, float(lo)))
+    hi = max(PDP_POLL_MIN_SEC, min(PDP_POLL_MAX_SEC, float(hi)))
+    if hi < lo:
+        hi = lo
+    return lo, hi
 
 
 class MonitorRunner:
@@ -164,10 +175,11 @@ class MonitorRunner:
                     next_product_idx += 1
                     delay = self._poll_one(db, mon, settings, tp)
                 else:
-                    delay = random.uniform(
+                    lo, hi = _clamp_pdp_poll(
                         float(mon.poll_online_min or settings.POLL_ONLINE_MIN),
                         float(mon.poll_online_max or settings.POLL_ONLINE_MAX),
                     )
+                    delay = random.uniform(lo, hi)
                 db.commit()
             except Exception as exc:
                 log_activity("error", f"Monitor loop error: {exc}", category=LogCategory.ERROR, source="monitor_runner")
@@ -254,11 +266,12 @@ class MonitorRunner:
 
         log_activity(
             "info",
-            f"Sitemap scan: {len(new_urls)} new candidate URL(s)",
+            f"Sitemap scan done — {len(new_urls)} new URL(s) to check against profiles",
             category=LogCategory.SCRAPER,
             source="sitemap",
         )
         pool = self._proxy_pool(db, mon)
+        matched_count = 0
         for url in new_urls:
             if self._stop.is_set():
                 break
@@ -285,13 +298,24 @@ class MonitorRunner:
             )
             db.add(tp)
             db.flush()
+            matched_count += 1
+            log_activity(
+                "info",
+                f"Matched profile «{profile.name}» — tracking: {data.title or url[:60]} "
+                f"[{status.value}] €{data.price_text or '—'}",
+                category=LogCategory.MONITORING,
+                source="discovery",
+            )
             if status != ProductStatus.OFFLINE:
                 self._maybe_alert_online(db, mon, tp, profile)
             if status == ProductStatus.IN_STOCK:
                 self._maybe_alert_stock(db, mon, tp, profile)
+
+        if matched_count:
             log_activity(
                 "info",
-                f"Discovered: {data.title or url[:60]}",
+                f"Added {matched_count} product(s) — will visit product pages every "
+                f"{mon.poll_online_min:.0f}–{mon.poll_online_max:.0f}s",
                 category=LogCategory.MONITORING,
                 source="discovery",
             )
@@ -314,6 +338,15 @@ class MonitorRunner:
         tp.status = new_status
         tp.last_checked_at = datetime.now(timezone.utc)
 
+        if prev != new_status:
+            log_activity(
+                "info",
+                f"Status change {prev.value} → {new_status.value}: {tp.title or tp.url[:60]} "
+                f"(profile «{profile.name}»)",
+                category=LogCategory.MONITORING,
+                source="pdp_poll",
+            )
+
         if prev == ProductStatus.OFFLINE and new_status in (
             ProductStatus.ONLINE_OOS,
             ProductStatus.IN_STOCK,
@@ -327,9 +360,12 @@ class MonitorRunner:
         if new_status == ProductStatus.OFFLINE:
             lo = float(mon.poll_offline_min or settings.POLL_OFFLINE_MIN)
             hi = float(mon.poll_offline_max or settings.POLL_OFFLINE_MAX)
-        else:
-            lo = float(mon.poll_online_min or settings.POLL_ONLINE_MIN)
-            hi = float(mon.poll_online_max or settings.POLL_ONLINE_MAX)
+            return random.uniform(lo, hi)
+
+        lo, hi = _clamp_pdp_poll(
+            float(mon.poll_online_min or settings.POLL_ONLINE_MIN),
+            float(mon.poll_online_max or settings.POLL_ONLINE_MAX),
+        )
         return random.uniform(lo, hi)
 
     def _maybe_alert_online(

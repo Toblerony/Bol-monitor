@@ -68,6 +68,11 @@ def run_blocking_startup(settings: Settings) -> None:
                 mon.discord_webhook_url = settings.DISCORD_WEBHOOK_URL
             if mon.sitemap_scan_interval_sec == 45.0:
                 mon.sitemap_scan_interval_sec = settings.SITEMAP_SCAN_INTERVAL_SEC
+            # Migrate old 4–8s PDP poll defaults → 5–10s (max 15)
+            if mon.poll_online_min < 5.0:
+                mon.poll_online_min = settings.POLL_ONLINE_MIN
+            if mon.poll_online_max < 5.0 or mon.poll_online_max > 15.0:
+                mon.poll_online_max = min(15.0, max(settings.POLL_ONLINE_MAX, mon.poll_online_min))
             db.commit()
     finally:
         db.close()

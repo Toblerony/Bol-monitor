@@ -65,12 +65,19 @@ export default function SettingsPage() {
         alerts_new_online: true,
         alerts_in_stock: true,
         sitemap_scan_interval_sec: parseFloat(String(form.sitemap_scan_interval_sec)),
-        poll_online_min: parseFloat(String(form.poll_online_min)),
-        poll_online_max: parseFloat(String(form.poll_online_max)),
+        poll_online_min: Math.min(15, Math.max(5, parseFloat(String(form.poll_online_min)) || 5)),
+        poll_online_max: Math.min(15, Math.max(5, parseFloat(String(form.poll_online_max)) || 10)),
         poll_offline_min: parseFloat(String(form.poll_offline_min)),
         poll_offline_max: parseFloat(String(form.poll_offline_max)),
       })
       toast("Settings saved", "success")
+      const { data } = await getMonitoring()
+      setForm((prev) => ({
+        ...prev,
+        poll_online_min: String(data.poll_online_min),
+        poll_online_max: String(data.poll_online_max),
+        sitemap_scan_interval_sec: String(data.sitemap_scan_interval_sec),
+      }))
     } catch (err) {
       toast(apiErrorMessage(err), "error")
     } finally {
@@ -222,25 +229,51 @@ export default function SettingsPage() {
             </div>
 
             <div className="pt-2 border-t">
-              <CardTitle className="text-base mb-3">Speed</CardTitle>
+              <CardTitle className="text-base mb-1">Speed</CardTitle>
+              <p className="text-xs text-muted-foreground mb-3">
+                Bol.com product pages are scraped as HTML (not Target Redsky). Sitemap finds new URLs; then each tracked product page is visited on a random interval.
+              </p>
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                 <div>
-                  <Label className="text-xs">Sitemap scan (sec, 300–900 = 5–15 min)</Label>
-                  <Input value={String(form.sitemap_scan_interval_sec || "")} onChange={(e) => setForm({ ...form, sitemap_scan_interval_sec: e.target.value })} />
+                  <Label className="text-xs">Sitemap scan interval (sec)</Label>
+                  <Input
+                    type="number"
+                    min={300}
+                    max={900}
+                    value={String(form.sitemap_scan_interval_sec || "")}
+                    onChange={(e) => setForm({ ...form, sitemap_scan_interval_sec: e.target.value })}
+                  />
+                  <p className="text-[11px] text-muted-foreground mt-1">300–900 = every 5–15 minutes</p>
                 </div>
                 <div>
-                  <Label className="text-xs">Online poll min / max</Label>
+                  <Label className="text-xs">Product page visit min / max (sec)</Label>
                   <div className="flex gap-2">
-                    <Input value={String(form.poll_online_min || "")} onChange={(e) => setForm({ ...form, poll_online_min: e.target.value })} />
-                    <Input value={String(form.poll_online_max || "")} onChange={(e) => setForm({ ...form, poll_online_max: e.target.value })} />
+                    <Input
+                      type="number"
+                      min={5}
+                      max={15}
+                      placeholder="5"
+                      value={String(form.poll_online_min || "")}
+                      onChange={(e) => setForm({ ...form, poll_online_min: e.target.value })}
+                    />
+                    <Input
+                      type="number"
+                      min={5}
+                      max={15}
+                      placeholder="10"
+                      value={String(form.poll_online_max || "")}
+                      onChange={(e) => setForm({ ...form, poll_online_max: e.target.value })}
+                    />
                   </div>
+                  <p className="text-[11px] text-muted-foreground mt-1">Random delay between visits — min 5, max 15</p>
                 </div>
                 <div className="sm:col-span-2">
-                  <Label className="text-xs">Offline poll min / max</Label>
+                  <Label className="text-xs">Offline product poll min / max (sec)</Label>
                   <div className="flex gap-2">
                     <Input value={String(form.poll_offline_min || "")} onChange={(e) => setForm({ ...form, poll_offline_min: e.target.value })} />
                     <Input value={String(form.poll_offline_max || "")} onChange={(e) => setForm({ ...form, poll_offline_max: e.target.value })} />
                   </div>
+                  <p className="text-[11px] text-muted-foreground mt-1">Slower checks when a page is offline / not found</p>
                 </div>
               </div>
             </div>

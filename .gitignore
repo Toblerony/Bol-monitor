@@ -1,5 +1,11 @@
-# ── Separate Target project (not part of Bol bot) ──
+# ── Separate projects (NOT part of Bol bot — never push) ──
 target/
+lazada/
+amazon-mx/
+amazon mexico/
+amazon_mexico/
+Amazon Mexico/
+_internal/
 
 # ── Secrets & env (never commit) ──
 .env
